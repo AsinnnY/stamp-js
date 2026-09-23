@@ -176,6 +176,9 @@ metadata tree.
 | Independent verification | `npm run test:verify` | 90 (CI) + 47 real-media |
 | ffprobe cross-check | `npm run test:ffprobe` | 4 per real video |
 
+`npm test` reports 340 assertions on Node 20/22 and 333 on Node 18, which skips
+the two `fs.openAsBlob`-backed sparse-file cases (that API is Node 20+); the
+sparse path is still covered there through `NodeFileSource`.
 `npm run test:all` runs the first four. The fuzz matrix feeds corrupt JPEG / PNG
 / MP4 inputs and asserts the same invariants for every one of them: no throw,
 refuse-with-a-reason on failure, structurally valid output, byte-identical media

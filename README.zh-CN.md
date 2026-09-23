@@ -154,7 +154,9 @@ BigInt / `setBigUint64` 仅在处理含 64 位块偏移的 MP4 时才会用到�
 | 独立验证 | `npm run test:verify` | 90（CI）+ 47（真实素材） |
 | ffprobe 交叉校验 | `npm run test:ffprobe` | 每个真实视频 4 项 |
 
-`npm run test:all` 跑前四项。fuzz 矩阵喂入损坏的 JPEG / PNG / MP4，对每个用例
+`npm test` 在 Node 20/22 下为 340 条断言，Node 18 下为 333 条（跳过两个依赖
+`fs.openAsBlob` 的稀疏文件用例，该 API 需要 Node 20+；稀疏路径在 Node 18 下仍由
+`NodeFileSource` 用例覆盖）。`npm run test:all` 跑前四项。fuzz 矩阵喂入损坏的 JPEG / PNG / MP4，对每个用例
 断言同一组不变式：不抛异常、失败必带原因、输出结构自洽、媒体载荷逐字节不变、幂等。
 
 `STAMP_TEST_MEDIA=<dir>` 指定真实素材目录。CI 跑 `npm test`（Node 18/20/22）与
