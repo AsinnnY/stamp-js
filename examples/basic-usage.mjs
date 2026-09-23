@@ -3,36 +3,53 @@
  *
  * Run with Node 18+:
  *   node examples/basic-usage.mjs
+ *
+ * The Node examples use `NodeFileSource` (`stamp-js/node`): it takes the file
+ * size from `fstat`, so it is correct for files of any size. The shorter
+ * `fs.openAsBlob(path)` + `BlobSource` route needs **Node 20+** and reports a
+ * 32-bit-truncated size for files >= 4 GiB, so it is only worth using for small
+ * files in a browser-like setting.
  */
 
-import { writeTags, inspect, BlobSource, BufferSource, HttpSource, partsToStream } from '../src/stamp.js';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import fs from 'node:fs';
+import { writeTags, inspect, BlobSource, BufferSource, HttpSource, partsToStream } from '../src/stamp.js';
+import { NodeFileSource } from '../src/node.js';
 
 /* ------------------------------------------------------------------ *
- * 1) Write tags into a local file (Blob / memory source → Blob output)
+ * 1) Write tags into a local file (file → stream → disk)
  * ------------------------------------------------------------------ */
 export async function writeTagsToFile(filePath, tags, outPath) {
-  const blob = await fs.openAsBlob(filePath);
-  const res = await writeTags(new BlobSource(blob), tags);
-  if (!res.ok) {
-    console.warn('[stamp] Skipped:', res.report.error);
-    return null;
+  const src = new NodeFileSource(filePath);
+  try {
+    const res = await writeTags(src, tags);
+    if (!res.ok) {
+      console.warn('[stamp] Skipped:', res.report.error);
+      return null;
+    }
+    // Media data is never copied into the heap: the stream reads the original
+    // bytes through reference slices while writing.
+    await pipeline(Readable.fromWeb(res.stream), fs.createWriteStream(outPath));
+    console.log(`[stamp] Wrote ${res.size} bytes (read ${res.report.stats.bytesRead} from source)`);
+    return outPath;
+  } finally {
+    src.close();   // only after the stream has been drained
   }
-  // res.blob is assembled from reference slices — media data is not copied
-  const buf = Buffer.from(await res.blob.arrayBuffer());
-  fs.writeFileSync(outPath, buf);
-  console.log(`[stamp] Wrote ${buf.length} bytes (read ${res.report.stats.bytesRead} from source)`);
-  return outPath;
 }
 
 /* ------------------------------------------------------------------ *
  * 2) Inspect before writing: is it safe? what codec?
  * ------------------------------------------------------------------ */
 export async function inspectFile(filePath) {
-  const blob = await fs.openAsBlob(filePath);
-  const info = await inspect(new BlobSource(blob));
-  console.log('[stamp] Inspect result:', JSON.stringify(info, null, 2));
-  return info;
+  const src = new NodeFileSource(filePath);
+  try {
+    const info = await inspect(src);
+    console.log('[stamp] Inspect result:', JSON.stringify(info, null, 2));
+    return info;
+  } finally {
+    src.close();
+  }
 }
 
 /* ------------------------------------------------------------------ *

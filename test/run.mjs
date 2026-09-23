@@ -426,7 +426,12 @@ function makeSparseFile(file, totalSize, plan) {
 }
 
 // ---------- E1: 2 GiB high-bitrate file, plan only, no materialize ----------
-{
+// `fs.openAsBlob` only exists on Node 20+; on Node 18 the sparse-file path is
+// still covered by the NodeFileSource cases (G14) and this Blob-backed variant
+// is reported as skipped rather than silently dropped.
+if (typeof fs.openAsBlob !== 'function') {
+  console.log('      \x1b[33m⚠ SKIP\x1b[0m E1 (fs.openAsBlob needs Node 20+; G14 covers the sparse path on Node 18)');
+} else {
   const BIG = 2 * 1024 ** 3;
   const plan = F.buildSparseMp4Plan(BIG, { chunks: 64, chunkSize: 1 << 20 });
   const file = path.join(tmp, 'big.mp4');
@@ -458,7 +463,9 @@ function makeSparseFile(file, totalSize, plan) {
 }
 
 // ---------- E2: 256 MiB, new vs old impl peak memory comparison ----------
-{
+if (typeof fs.openAsBlob !== 'function') {
+  console.log('      \x1b[33m⚠ SKIP\x1b[0m E2 (fs.openAsBlob needs Node 20+)');
+} else {
   const MID = 256 * 1024 ** 2;
   const plan = F.buildSparseMp4Plan(MID, { chunks: 32, chunkSize: 1 << 20 });
   const file = path.join(tmp, 'mid.mp4');
