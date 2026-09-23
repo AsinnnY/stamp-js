@@ -4,34 +4,8 @@
 [![npm](https://img.shields.io/npm/v/@asinnn/stamp-js.svg)](https://www.npmjs.com/package/@asinnn/stamp-js)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Stop loading the ffmpeg.wasm core (62 MB unpacked) just to change a video's title.**
-
-stamp-js writes XMP, native EXIF (JPEG IFD0, PNG `eXIf`) and iTunes-style tags
-into JPEG, PNG, MP4 and MOV at the box/chunk level — no re-encode, no re-mux,
-and the media payload never enters the JavaScript heap. It reads the container
-header, plans the edits, and returns a `Blob` / `ReadableStream` assembled from
-**reference slices** of the original file.
-
-Measured by `npm test` (Node 22, sparse files):
-
-| | |
-|---|---|
-| 4 GiB MP4 — metadata surgery | **~4 ms**, after reading **66 KB** (0.0015% of the file) |
-| 2 GiB MP4 — Blob assembled by reference | **26 ms**, after reading 66 KB |
-| 256 MiB file — peak heap, new vs read-everything | **0.01 MB** vs ~1 GB |
-| Bundle | ~32 KB gzipped, zero dependencies |
-
-Producing the *output* is a copy of the untouched payload, so it is bounded by
-your disk or network speed (13 s for 4 GiB here, ~0.3 GB/s). The point is that
-**the metadata work itself never scales with the media size, and the payload is
-never parsed** — no codec, no container walk over `mdat`, no re-encode.
-
-To describe the architecture precisely: **random-access metadata surgery +
-reference-slice assembly + streaming output**, not a transform-stream pipeline
-(`input stream → transform → output stream`). For a `Blob`/`File` the result is
-`new Blob([original slice, new bytes, original slice, …])`; only sources that
-cannot be sliced locally (HTTP Range, `NodeFileSource`) are piped out as a
-`ReadableStream`.
+Write metadata (XMP / iTunes tags) into JPEG, PNG, MP4 and MOV **without reading
+the media payload into memory**.
 
 English | [简体中文](README.zh-CN.md)
 
@@ -40,7 +14,16 @@ English | [简体中文](README.zh-CN.md)
 Most browser-side metadata writers read the whole file, modify it, and write it
 back — peak memory ≈ 3–4× file size, so a 500 MB video freezes or crashes the
 tab. stamp-js reads only the container header, rewrites only the bytes that
-must change, and assembles the output from reference slices of the original.
+must change, and assembles the output from **reference slices** of the original.
+Media data is never copied or parsed, so memory stays flat regardless of file
+size.
+
+To describe it precisely: this is **random-access metadata surgery +
+reference-slice assembly + streaming output**, not a transform-stream pipeline
+(`input stream → transform → output stream`). For a `Blob`/`File` the result is
+`new Blob([original slice, new bytes, original slice, …])`; only sources that
+cannot be sliced locally (HTTP Range, `NodeFileSource`) are piped out as a
+`ReadableStream`.
 
 | | Read-everything writers | stamp-js |
 |---|---|---|

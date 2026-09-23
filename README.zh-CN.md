@@ -4,29 +4,7 @@
 [![npm](https://img.shields.io/npm/v/@asinnn/stamp-js.svg)](https://www.npmjs.com/package/@asinnn/stamp-js)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**别再为了改一个视频标题，去加载 ffmpeg.wasm 内核（解包 62 MB）。**
-
-stamp-js 在盒子/块层级把 XMP、原生 EXIF（JPEG IFD0、PNG `eXIf`）与 iTunes 风格标签
-写进 JPEG、PNG、MP4、MOV —— 不重新编码、不重新封装，媒体数据**从不进入 JS 堆**。
-它只读容器头、规划编辑，然后返回由原文件**引用切片**组装成的 `Blob` / `ReadableStream`。
-
-`npm test` 实测（Node 22，稀疏文件）：
-
-| | |
-|---|---|
-| 4 GiB MP4 —— 元数据手术 | **约 4 ms**，仅读取 **66 KB**（占文件 0.0015%） |
-| 2 GiB MP4 —— Blob 按引用组装 | **26 ms**，仅读取 66 KB |
-| 256 MiB 文件 —— 峰值堆内存（新 vs 读整文件） | **0.01 MB** vs 约 1 GB |
-| 体积 | 约 32 KB（gzip），零依赖 |
-
-**产出文件**是把未被触碰的载荷拷一遍，因此速度取决于磁盘/网络（本机 4 GiB 约 13 秒，
-≈0.3 GB/s）。要强调的是：**元数据操作本身与媒体大小无关，且载荷从头到尾不被解析** ——
-不解码、不遍历 `mdat`、不重新编码。
-
-准确描述这套架构：**随机访问式元数据手术 + 引用切片组装 + 流式输出**，
-而不是 `输入流 → transform → 输出流` 管道。对 `Blob`/`File`，输出就是
-`new Blob([原文件切片, 新字节, 原文件切片, …])`；只有无法本地切片的数据源
-（HTTP Range、`NodeFileSource`）才以 `ReadableStream` 导出。
+向 JPEG、PNG、MP4、MOV 写入元数据（XMP / iTunes 标签），**不把媒体数据读入内存**。
 
 [English](README.md) | 简体中文
 
@@ -34,7 +12,7 @@ stamp-js 在盒子/块层级把 XMP、原生 EXIF（JPEG IFD0、PNG `eXIf`）与
 
 多数浏览器端元数据写入器把整个文件读出、改完再写回 —— 峰值内存约为文件大小的
 3–4 倍，500 MB 视频会卡死或崩溃标签页。stamp-js 只读容器头，只改必须改的几个字节，
-输出由原文件的引用切片组装而成。媒体数据不被复制、不被解析，内存开销与文件大小无关。
+输出由原文件的**引用切片**组装而成。媒体数据不被复制、不被解析，内存开销与文件大小无关。
 
 准确地说，这是**随机访问式元数据手术 + 引用切片组装 + 流式输出**，而不是
 `输入流 → transform → 输出流` 的转换管道：对 `Blob`/`File`，输出就是
