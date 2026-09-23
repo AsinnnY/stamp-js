@@ -1,0 +1,155 @@
+name: CI
+
+# Three tiers (see CONTRIBUTING.md#ci):
+#   Tier 1  tier1-gate      every commit  — unit+regression (incl. sparse 4/8 GiB),
+#                                           UMD build/smoke, dist in sync
+#   Tier 2  tier2-verify    every commit  — fuzz/malformed matrix + third-party tool interop
+#   Tier 3  tier3-release   tags / manual — real device material + ffprobe cross-check
+# A tier never silently degrades: the Python suites exit 2 (not 0) when a
+# third-party tool is missing, so a green run always means "actually verified".
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  # ------------------------------- Tier 1 -------------------------------
+  tier1-gate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Unit + regression suite
+        run: node --expose-gc test/run.mjs
+
+      - name: Build UMD
+        run: node scripts/build-umd.mjs
+
+      - name: Verify UMD loads and exports the public API
+        run: |
+          node -e "
+            const s = require('./dist/stamp.umd.js');
+            for (const fn of ['writeTags','inspect','capabilities','probeMp4','planMp4'])
+              if (typeof s[fn] !== 'function') throw new Error('UMD missing ' + fn);
+            console.log('UMD ok');
+          "
+
+      # dist/ is committed (Tampermonkey users load it from unpkg), so a stale
+      # bundle would ship without the latest fixes. Rebuild and require a clean tree.
+      - name: Verify dist/ is in sync with src/
+        run: |
+          node scripts/build-umd.mjs
+          if ! git diff --quiet -- dist/; then
+            echo "::error::dist/stamp.umd.js is stale — run 'npm run build' and commit dist/"
+            git diff --stat -- dist/
+            exit 1
+          fi
+
+  # ------------------------------- Tier 2 -------------------------------
+  tier2-verify:
+    runs-on: ubuntu-latest
+    needs: tier1-gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install verification dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3 python3-pip python3-pil libimage-exiftool-perl
+          python3 -m pip install --quiet requests || pip install --quiet requests
+
+      # Malformed / fuzz matrix: every corrupt input must either be refused with
+      # a reason or produce a structurally valid file whose media payload is
+      # byte-identical (never a crash, never silent corruption).
+      - name: Malformed / fuzz matrix
+        run: node test/malformed.mjs
+
+      - name: Interop tests (real files + exiftool + Pillow)
+        run: python3 test/interop-test.py
+
+      # Independent verification: expectations are rebuilt with third-party
+      # tools and hand-written parsers, never from the library's own assertions.
+      # Real device material lives outside the repo, so those sections self-skip;
+      # point STAMP_TEST_MEDIA at a directory to run them.
+      - name: Independent verification suite
+        run: python3 test/independent-verify.py
+
+      - name: Confirm the verification suites did not silently skip
+        run: |
+          set -o pipefail
+          python3 test/independent-verify.py | tail -3
+          # exit code 2 means "dependency missing"; the suite must not be green by default
+          python3 test/independent-verify.py > /dev/null
+          echo "independent verification ran with all dependencies present"
+
+  # ------------------------------- Tier 3 -------------------------------
+  # Runs on release tags / manual dispatch only: it needs real device material
+  # (vivo motion photos, WeChat/iOS exports, …) which is not in the repository.
+  tier3-release:
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: tier2-verify
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install verification dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3 python3-pip python3-pil libimage-exiftool-perl ffmpeg
+          python3 -m pip install --quiet requests || pip install --quiet requests
+
+      - name: Fetch real device material
+        # Real files are not redistributable; expose them as a workflow artifact
+        # or set the STAMP_TEST_MEDIA repository variable to a path that exists
+        # on the runner (e.g. a cached download step).
+        run: |
+          if [ -d "${STAMP_TEST_MEDIA:-/workspace/upload}" ]; then
+            echo "real material found at ${STAMP_TEST_MEDIA:-/workspace/upload}"
+          else
+            echo "::warning::no real material directory; real-device sections will self-skip"
+          fi
+        env:
+          STAMP_TEST_MEDIA: ${{ vars.STAMP_TEST_MEDIA }}
+
+      - name: Real device material suite
+        run: python3 test/real-file-test.py
+        env:
+          STAMP_TEST_MEDIA: ${{ vars.STAMP_TEST_MEDIA }}
+
+      - name: Independent verification incl. real material
+        run: python3 test/independent-verify.py
+        env:
+          STAMP_TEST_MEDIA: ${{ vars.STAMP_TEST_MEDIA }}
+
+      # ffprobe cross-check: after tagging, every real video must still demux to
+      # the same streams/codecs/duration (ffmpeg is only required here).
+      # Sparse >4 GiB files are already covered by the Tier 1 unit suite.
+      - name: ffprobe cross-check on tagged videos
+        run: python3 test/ffprobe-crosscheck.py
+        env:
+          STAMP_TEST_MEDIA: ${{ vars.STAMP_TEST_MEDIA }}

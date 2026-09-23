@@ -1,0 +1,66 @@
+{
+  "name": "stamp-js",
+  "version": "0.1.0",
+  "description": "Low-memory media metadata writer: writes XMP / iTunes tags into JPEG, PNG, and MP4/MOV without re-muxing or re-encoding.",
+  "type": "module",
+  "main": "./src/stamp.js",
+  "module": "./src/stamp.js",
+  "exports": {
+    ".": "./src/stamp.js",
+    "./node": "./src/node.js",
+    "./src/*": "./src/*"
+  },
+  "unpkg": "./dist/stamp.umd.js",
+  "jsdelivr": "./dist/stamp.umd.js",
+  "sideEffects": false,
+  "files": [
+    "src",
+    "dist",
+    "README.md",
+    "README.zh-CN.md",
+    "ARCHITECTURE.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "RELEASING.md"
+  ],
+  "scripts": {
+    "test": "node --expose-gc test/run.mjs",
+    "test:watch": "node --expose-gc --watch test/run.mjs",
+    "test:interop": "python3 test/interop-test.py",
+    "test:real": "python3 test/real-file-test.py",
+    "test:verify": "python3 test/independent-verify.py",
+    "build": "node scripts/build-umd.mjs",
+    "test:fuzz": "node test/malformed.mjs",
+    "test:all": "npm test && npm run test:fuzz && npm run test:interop && npm run test:verify",
+    "test:ffprobe": "python3 test/ffprobe-crosscheck.py",
+    "prepublishOnly": "npm run build && npm test && npm run test:fuzz"
+  },
+  "keywords": [
+    "metadata",
+    "xmp",
+    "exif",
+    "itunes-tags",
+    "mp4",
+    "mov",
+    "jpeg",
+    "png",
+    "isobmff",
+    "browser",
+    "streaming",
+    "low-memory"
+  ],
+  "author": "Asinnn <asinnn@qq.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AsinnnY/stamp-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AsinnnY/stamp-js/issues"
+  },
+  "homepage": "https://github.com/AsinnnY/stamp-js#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {}
+}

@@ -1,0 +1,2458 @@
+/**
+ * stamp.js — Low-memory media metadata writer (box-level, zero-dependency)
+ * =============================================================================
+ *
+ * Writes XMP / iTunes-style tags into JPEG, PNG, and MP4/MOV files without
+ * re-muxing or re-encoding. Only the bytes that must change are read into the
+ * JS heap; the media payload is preserved as reference slices.
+ *
+ * Design principles
+ *   1. Read only what is needed: JPEG/PNG headers, MP4 top-level box headers
+ *      + moov. The media data (mdat) never enters the JS heap.
+ *   2. Move only what is needed: output is assembled from reference slices.
+ *      In runtimes that implement Blob composition by reference (browsers,
+ *      Node), the media payload is not copied.
+ *   3. Probe before acting: detect faststart, moov position, fragmentation
+ *      (fMP4), and free-box availability, then choose offset-preserving,
+ *      offset-shifting, or refuse-and-fallback — never produce a corrupt file.
+ *   4. Idempotent: repeated writes do not create duplicate XMP segments or
+ *      duplicate udta boxes.
+ *   5. Keep absolute offset tables honest: MP4 stco/co64 and JPEG MPF
+ *      (motion-photo / multi-picture index) are rebased whenever the container
+ *      length changes. Only those tables are rewritten; payloads stay as
+ *      reference slices.
+ *
+ * Explicitly unsupported (returns ok:false with a reason, never silently
+ * corrupts):
+ *   - Fragmented MP4 / CMAF when insertion before media data is required
+ *     (offsets are scattered across moof/trun/saio/sidx)
+ *   - Boxes larger than 2^53 bytes
+ *
+ * Runtime: modern Chrome/Edge/Firefox/Safari, Node 18+, Deno, Web Workers.
+ * =============================================================================
+ */
+
+/* ===========================================================================
+ * 0. Utilities
+ * ========================================================================= */
+
+const TE = new TextEncoder();
+
+export const utf8 = (s) => TE.encode(String(s));
+export const u16 = (b, o) => ((b[o] << 8) | b[o + 1]) >>> 0;
+export const u32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+export const fourcc = (b, o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+
+export function u64(b, o) {
+  const hi = u32(b, o);
+  if (hi > 0x1fffff) throw fail('UNSUPPORTED_LARGESIZE', 'value exceeds 2^53; box sizes and 64-bit offsets beyond that are not supported');
+  return hi * 4294967296 + u32(b, o + 4);
+}
+
+export function cat(list) {
+  let n = 0;
+  for (const c of list) n += c.length;
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const c of list) { out.set(c, o); o += c.length; }
+  return out;
+}
+
+const xmlEsc = (s) => String(s ?? '')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+/* ===========================================================================
+ * 1. Source abstraction: unified interface for random-access read + reference
+ *    slicing. This is the foundation of low-memory operation: read() fetches
+ *    only the requested range; slice() returns a reference without copying.
+ * ========================================================================= */
+
+export class Source {
+  constructor() {
+    this.size = 0;
+    this.type = '';
+    this.stats = { readCalls: 0, bytesRead: 0, maxReadSize: 0, sliceCalls: 0 };
+  }
+  async read(_start, _end) { throw new Error('Source.read() not implemented'); }
+  canSlice() { return false; }
+  slice(_start, _end) { throw new Error('this source does not support reference slicing'); }
+  async _read(start, end) {
+    start = Math.max(0, Math.floor(start));
+    end = Math.min(this.size, Math.ceil(end));
+    if (!(end > start)) return new Uint8Array(0);
+    const out = await this.read(start, end);
+    this.stats.readCalls++;
+    this.stats.bytesRead += out.length;
+    if (out.length > this.stats.maxReadSize) this.stats.maxReadSize = out.length;
+    return out;
+  }
+  _slice(start, end) {
+    start = Math.max(0, Math.floor(start));
+    end = Math.min(this.size, Math.ceil(end));
+    if (!(end > start)) return null;
+    this.stats.sliceCalls++;
+    return this.slice(start, end);
+  }
+}
+
+export class BlobSource extends Source {
+  constructor(blob) {
+    super();
+    if (!blob || typeof blob.size !== 'number') throw new TypeError('BlobSource requires a Blob');
+    this.blob = blob;
+    this.size = blob.size;
+    this.type = blob.type || '';
+  }
+  async read(start, end) {
+    const buf = await this.blob.slice(start, end).arrayBuffer();
+    return new Uint8Array(buf);
+  }
+  canSlice() { return true; }
+  slice(start, end) { return this.blob.slice(start, end); }
+}
+
+export class BufferSource extends Source {
+  constructor(bytes, type = '') {
+    super();
+    this.bytes = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    this.size = this.bytes.byteLength;
+    this.type = type;
+  }
+  async read(start, end) { return this.bytes.subarray(start, end); }
+  canSlice() { return true; }
+  slice(start, end) { return this.bytes.subarray(start, end); }
+}
+
+/**
+ * HTTP data source with Range request support.
+ *
+ * If the server does not support Range requests (returns 200 instead of 206),
+ * init() sets rangeSupported = false and read() will refuse to serve random
+ * access — preventing the entire response body from being loaded into memory.
+ *
+ * Since this source cannot slice locally, the output path is a ReadableStream
+ * (see partsToStream), which can be piped directly to a WritableStream
+ * (e.g. File System Access API) for a network-to-disk pipeline with minimal
+ * heap usage.
+ */
+export class HttpSource extends Source {
+  constructor(url, { fetchImpl = globalThis.fetch, type = '', size = null } = {}) {
+    super();
+    this.url = url;
+    this.fetchImpl = fetchImpl;
+    this.size = size ?? 0;
+    this.type = type;
+    this.rangeSupported = null;
+  }
+  async init() {
+    if (this.size) return this;
+    const res = await this.fetchImpl(this.url, { headers: { Range: 'bytes=0-0' } });
+    try {
+      const cr = res.headers && res.headers.get && res.headers.get('content-range');
+      if (res.status === 206 && cr) {
+        const m = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/.exec(String(cr).trim());
+        if (!m) throw fail('RANGE_UNSUPPORTED', 'Content-Range header is malformed: ' + cr);
+        const total = Number(m[3]);
+        if (!Number.isFinite(total) || total < 0)
+          throw fail('RANGE_UNSUPPORTED', 'Content-Range total size is invalid: ' + cr);
+        this.size = total;
+        this.rangeSupported = true;
+      } else {
+        const len = res.headers && res.headers.get && res.headers.get('content-length');
+        const size = Number(len);
+        if (!Number.isFinite(size) || size < 0)
+          throw fail('RANGE_UNSUPPORTED',
+            'Server does not support Range and Content-Length is invalid; cannot perform random access');
+        this.size = size;
+        this.rangeSupported = false;
+      }
+    } finally {
+      // Release the probe response on *both* paths; a 200 response otherwise
+      // leaves an unconsumed body behind for the lifetime of the response.
+      try { if (res.body && res.body.cancel) await res.body.cancel(); } catch { /* ignore */ }
+    }
+    return this;
+  }
+  async read(start, end) {
+    if (this.rangeSupported === false)
+      throw fail('RANGE_UNSUPPORTED', 'Server does not support Range requests; random access is unavailable');
+    const res = await this.fetchImpl(this.url, { headers: { Range: `bytes=${start}-${end - 1}` } });
+    if (res.status !== 206)
+      throw fail('RANGE_UNSUPPORTED', 'Range request failed: HTTP ' + res.status + ' (expected 206 Partial Content)');
+    const want = end - start;
+    const buf = new Uint8Array(await res.arrayBuffer());
+    // A 206 does not prove the server honoured *our* range: a caching proxy or a
+    // buggy origin can answer 206 with a different window, and accepting it
+    // would feed misaligned bytes into the parser. Verify Content-Range and the
+    // body length before trusting the data.
+    const cr = res.headers && res.headers.get && res.headers.get('content-range');
+    if (cr) {
+      const m = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/.exec(String(cr).trim());
+      if (!m || Number(m[1]) !== start || Number(m[2]) !== end - 1)
+        throw fail('RANGE_MISMATCH',
+          `server ignored the requested range: asked bytes=${start}-${end - 1}, got Content-Range "${cr}"`);
+    }
+    if (buf.length < want)
+      throw fail('RANGE_MISMATCH', `short read: asked ${want} bytes at offset ${start}, got ${buf.length}`);
+    return buf.length > want ? buf.subarray(0, want) : buf;
+  }
+  canSlice() { return false; }
+}
+
+/** Top-level box header cursor with a sliding window, avoiding per-box
+ *  round-trips when fMP4 has thousands of boxes. */
+class HeaderWindow {
+  constructor(src, window = 65536, seed = null) {
+    this.src = src; this.window = window;
+    this.buf = seed && seed.length ? seed : null;
+    this.base = 0;
+  }
+  async header(pos) {
+    if (pos + 8 > this.src.size) return null;
+    if (!this.buf || pos < this.base || pos + 16 > this.base + this.buf.length) {
+      const end = Math.min(this.src.size, pos + this.window);
+      this.buf = await this.src._read(pos, end);
+      this.base = pos;
+    }
+    const off = pos - this.base;
+    if (off + 8 > this.buf.length) return null;
+    return { buf: this.buf, off };
+  }
+}
+
+/* ===========================================================================
+ * 2. Format detection
+ * ========================================================================= */
+
+export function sniff(bytes, type = '') {
+  const m = (type || '').toLowerCase();
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'jpeg';
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'png';
+  if (bytes.length >= 12 && fourcc(bytes, 4) === 'ftyp') return 'mp4';
+  if (bytes.length >= 4 && fourcc(bytes, 0) === 'RIFF') return 'riff';
+  if (bytes.length >= 4 && bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) return 'ebml';
+  if (/jpe?g/.test(m)) return 'jpeg';
+  if (/png/.test(m)) return 'png';
+  if (/mp4|mov|m4v/.test(m)) return 'mp4';
+  return 'unknown';
+}
+
+/**
+ * Read [0, need) from the source. If a seed (bytes already read during
+ * probing) is available, it is reused so the same byte range is never read
+ * twice — this keeps the bytesRead metric trustworthy.
+ */
+async function readHeadAt(src, need, seed) {
+  const want = Math.min(need, src.size);
+  if (seed && seed.length >= want) return seed.subarray(0, want);
+  const from = seed ? seed.length : 0;
+  if (!(want > from)) return seed ? seed.subarray(0, want) : new Uint8Array(0);
+  const rest = await src._read(from, want);
+  return seed ? cat([seed, rest]) : rest;
+}
+
+/* ===========================================================================
+ * 3. Codec: unified tag model -> per-container native fields
+ *    tags = { title, artist, date, comment, url, software, copyright,
+ *             keywords[] }
+ * ========================================================================= */
+
+function normalizeTags(tags) {
+  const t = {
+    title: '', artist: '', date: '', comment: '', url: '', software: '',
+    copyright: '', keywords: null,
+  };
+  for (const k of Object.keys(t)) if (tags && tags[k] != null) t[k] = tags[k];
+  return t;
+}
+
+/**
+ * Would this write actually change anything? An empty/unknown-only object used
+ * to silently replace existing XMP with an empty packet — i.e. wipe the user's
+ * metadata through what looks like a no-op call. Refuse instead.
+ */
+function hasWritableTags(tags) {
+  if (!tags) return false;
+  const t = normalizeTags(tags);
+  const text = ['title', 'artist', 'date', 'comment', 'url', 'software', 'copyright'];
+  if (text.some((k) => String(t[k]).length > 0)) return true;
+  return Array.isArray(t.keywords) && t.keywords.filter((k) => String(k ?? '').length > 0).length > 0;
+}
+
+/** Every tag field the public API accepts, in a stable order. */
+export const TAG_FIELDS = ['title', 'artist', 'date', 'comment', 'url', 'software', 'copyright', 'keywords'];
+
+/**
+ * MP4/MOV maps tags onto iTunes atoms (mdir) or mdta keys — both single-valued.
+ * There is no standard multi-value keyword tag in the iTunes metadata model, so
+ * `keywords` is XMP-only (JPEG/PNG). Requesting it for an MP4 is refused rather
+ * than written somewhere invented: silently ignoring it used to report ok:true
+ * while nothing was stored.
+ */
+const MP4_UNSUPPORTED_TAGS = ['keywords'];
+
+/** Which tag fields a container can actually store. */
+export function capabilities(format) {
+  const f = String(format || '').toLowerCase();
+  const isMp4 = f === 'mp4' || f === 'mov' || f === 'isobmff';
+  const unsupported = isMp4 ? MP4_UNSUPPORTED_TAGS.slice() : [];
+  return {
+    format: isMp4 ? 'mp4' : f,
+    supported: TAG_FIELDS.filter((k) => !unsupported.includes(k)),
+    unsupported,
+  };
+}
+
+/** The non-empty fields the caller actually asked for. */
+function requestedFields(tags) {
+  const t = normalizeTags(tags);
+  const out = [];
+  for (const k of TAG_FIELDS) {
+    if (k === 'keywords') {
+      if (Array.isArray(t.keywords) && t.keywords.some((v) => String(v ?? '').length > 0)) out.push(k);
+    } else if (String(t[k]).length > 0) out.push(k);
+  }
+  return out;
+}
+
+/** Error carrying a machine-readable code, surfaced as `report.errorCode`. */
+function fail(code, message) {
+  const e = new Error(message);
+  e.code = code;
+  return e;
+}
+
+/** Human-readable reason for containers we deliberately do not write. */
+const FORMAT_HINTS = {
+  riff: 'WebP/RIFF stores XMP in a RIFF chunk that is not handled yet',
+  ebml: 'WebM/MKV needs EBML SeekHead/Cues recalculation (absolute offsets)',
+};
+/** ISOBMFF ftyp brands that are images, not MP4 video (they use meta/iloc, not moov/udta). */
+const ISOBMFF_IMAGE_BRANDS = {
+  avif: 'AVIF image', avis: 'AVIF image sequence',
+  heic: 'HEIC image', heix: 'HEIC image', heif: 'HEIF image',
+  mif1: 'HEIF image', msf1: 'HEIF image sequence',
+};
+
+/* ------------------------------- XMP (JPEG / generic) --------------------- */
+
+export function buildXmpPacket(tags) {
+  const t = normalizeTags(tags);
+  const desc = [t.comment, t.url ? 'URL: ' + t.url : ''].filter(Boolean).join('\n\n');
+  const kw = Array.isArray(t.keywords) && t.keywords.length
+    ? `   <dc:subject><rdf:Bag>${t.keywords.map((k) => `<rdf:li>${xmlEsc(k)}</rdf:li>`).join('')}</rdf:Bag></dc:subject>\n`
+    : '';
+  return `<?xpacket begin="\uFEFF" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/">
+   <dc:title><rdf:Alt><rdf:li xml:lang="x-default">${xmlEsc(t.title)}</rdf:li></rdf:Alt></dc:title>
+   <dc:creator><rdf:Seq><rdf:li>${xmlEsc(t.artist)}</rdf:li></rdf:Seq></dc:creator>
+   <dc:description><rdf:Alt><rdf:li xml:lang="x-default">${xmlEsc(desc)}</rdf:li></rdf:Alt></dc:description>
+   <dc:source>${xmlEsc(t.url)}</dc:source>
+   <dc:rights><rdf:Alt><rdf:li xml:lang="x-default">${xmlEsc(t.copyright)}</rdf:li></rdf:Alt></dc:rights>
+${kw}   <xmp:CreateDate>${xmlEsc(t.date)}</xmp:CreateDate>
+   <xmp:CreatorTool>${xmlEsc(t.software)}</xmp:CreatorTool>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`;
+}
+
+export const XMP_NS = 'http://ns.adobe.com/xap/1.0/';
+
+/**
+ * Namespace of Extended XMP fragments. When an XMP packet exceeds the 64 KB
+ * single-segment limit, Adobe's spec splits it: the main APP1 packet declares
+ * `xmpNote:HasExtendedXMP="<GUID>"` and one or more extra APP1 segments carry
+ * the remainder under this namespace, each prefixed with GUID(32) +
+ * full-length(4) + this-chunk offset(4).
+ *
+ * We never write Extended XMP, so every fragment found in a file becomes stale
+ * the moment the standard packet is replaced — they are dropped wholesale
+ * rather than matched by GUID, which keeps this a pure prefix scan.
+ */
+export const XMP_EXT_NS = 'http://ns.adobe.com/xmp/extension/';
+
+/** Does the segment payload at `at` start with `str` followed by a NUL? */
+function payloadIsNs(b, at, str) {
+  for (let i = 0; i < str.length; i++) if (b[at + i] !== str.charCodeAt(i)) return false;
+  return b[at + str.length] === 0;
+}
+
+function buildXmpApp1(tags) {
+  const ns = utf8(XMP_NS + '\0');
+  const packet = utf8(buildXmpPacket(tags));
+  const segLen = 2 + ns.length + packet.length;
+  if (segLen > 0xffff) throw fail('XMP_TOO_LARGE', 'XMP packet exceeds JPEG single-segment 64KB limit; shorten the content');
+  const seg = new Uint8Array(2 + segLen);
+  seg[0] = 0xff; seg[1] = 0xe1;
+  seg[2] = (segLen >> 8) & 0xff; seg[3] = segLen & 0xff;
+  seg.set(ns, 4);
+  seg.set(packet, 4 + ns.length);
+  return seg;
+}
+
+/* --------------------------------- PNG iTXt ------------------------------- */
+
+function pngChunk(type, data) {
+  const out = new Uint8Array(12 + data.length);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, data.length);
+  for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+  out.set(data, 8);
+  dv.setUint32(8 + data.length, crc32(out.subarray(4, 8 + data.length)));
+  return out;
+}
+
+function itxtChunk(keyword, value) {
+  if (!value) return null;
+  const kw = utf8(keyword);
+  const val = utf8(String(value));
+  // keyword \0 compressionFlag(0) compressionMethod(0) languageTag \0 translatedKeyword \0 text
+  const data = cat([kw, new Uint8Array([0, 0, 0]), new Uint8Array([0]), new Uint8Array([0]), val]);
+  return pngChunk('iTXt', data);
+}
+
+export const PNG_XMP_KEYWORD = 'XML:com.adobe.xmp';
+/** PNG text chunk keywords that this library writes; existing chunks with
+ *  these keywords are removed before writing (ensures idempotency). */
+const PNG_OWN_KEYWORDS = new Set(['Title', 'Author', 'Description', 'Creation Time', 'Copyright', 'Software', PNG_XMP_KEYWORD]);
+
+function buildPngTextChunks(tags) {
+  const t = normalizeTags(tags);
+  const out = [
+    itxtChunk(PNG_XMP_KEYWORD, buildXmpPacket(tags)),
+    itxtChunk('Title', t.title),
+    itxtChunk('Author', t.artist),
+    itxtChunk('Description', [t.comment, t.url ? 'URL: ' + t.url : ''].filter(Boolean).join('\n\n')),
+    itxtChunk('Creation Time', t.date),
+    itxtChunk('Copyright', t.copyright),
+    itxtChunk('Software', t.software),
+  ].filter(Boolean);
+  return out.length ? cat(out) : null;
+}
+
+/* ------------------------------- MP4 (ISO-BMFF) --------------------------- */
+
+function mp4Box(type, body) {
+  const b = new Uint8Array(8 + body.length);
+  new DataView(b.buffer).setUint32(0, b.length);
+  for (let i = 0; i < 4; i++) b[4 + i] = type.charCodeAt(i) & 0xff;
+  b.set(body, 8);
+  return b;
+}
+
+function mp4FullBox(type, ver, flags, body) {
+  const b = new Uint8Array(12 + body.length);
+  const dv = new DataView(b.buffer);
+  dv.setUint32(0, b.length);
+  for (let i = 0; i < 4; i++) b[4 + i] = type.charCodeAt(i) & 0xff;
+  b[8] = ver; b[9] = (flags >> 16) & 0xff; b[10] = (flags >> 8) & 0xff; b[11] = flags & 0xff;
+  b.set(body, 12);
+  return b;
+}
+
+/** name can be a 4-byte atom name like '\xA9nam', or a mdta 4-byte index */
+function mp4Data(name, value) {
+  const payload = utf8(value);
+  const inner = new Uint8Array(16 + payload.length);
+  const iv = new DataView(inner.buffer);
+  iv.setUint32(0, inner.length);
+  for (let i = 0; i < 4; i++) inner[4 + i] = 'data'.charCodeAt(i);
+  iv.setUint32(8, 1);   // type_indicator = 1 → UTF-8
+  iv.setUint32(12, 0);  // locale
+  inner.set(payload, 16);
+  return mp4Box(name, inner);
+}
+
+/** QuickTime-style: hdlr = 'mdir', atom names are fixed ©nam/©ART/... */
+function buildMdirEntries(tags) {
+  const t = normalizeTags(tags);
+  const cmt = [t.comment, t.url ? 'URL: ' + t.url : ''].filter(Boolean).join('\n');
+  const list = [];
+  if (t.title) list.push(['\xa9nam', t.title]);
+  if (t.artist) list.push(['\xa9ART', t.artist]);
+  if (t.date) list.push(['\xa9day', t.date]);
+  if (cmt) list.push(['\xa9cmt', cmt]);
+  if (t.software) list.push(['\xa9too', t.software]);
+  // 'cprt' is the atom exiftool (and iTunes-era readers) resolve to Copyright;
+  // '©cpy' is the widely guessed name but no reader maps it.
+  if (t.copyright) list.push(['cprt', t.copyright]);
+  return list.map(([n, v]) => ({ name: n, box: mp4Data(n, v), key: null }));
+}
+
+/** Modern style: hdlr = 'mdta', keys table + numeric-index ilst
+ *  (supports arbitrary-length custom key names) */
+function buildMdtaEntries(tags) {
+  const t = normalizeTags(tags);
+  const cmt = [t.comment, t.url ? 'URL: ' + t.url : ''].filter(Boolean).join('\n');
+  const pairs = [];
+  if (t.title) pairs.push(['title', t.title]);
+  if (t.artist) pairs.push(['artist', t.artist]);
+  if (t.date) pairs.push(['date', t.date]);
+  if (cmt) pairs.push(['comment', cmt]);
+  if (t.software) pairs.push(['software', t.software]);
+  if (t.copyright) pairs.push(['copyright', t.copyright]);
+  return pairs.map(([k, v]) => ({ name: null, key: k, value: v }));
+}
+
+/**
+ * Rewrite a mdta ilst entry's 4-byte numeric index so that it resolves to
+ * `keyValue` in the merged keys table. An ilst entry is size(4) + index(4),
+ * so the index lives at offset 4. Without this, an entry taken from a second
+ * udta would keep pointing at its *old* table position and silently read back
+ * as a different tag (see "udta merging" in ARCHITECTURE.md).
+ */
+function remapMdtaEntryIndex(raw, keyValue, keys) {
+  const idx = keys.indexOf(keyValue);
+  if (idx < 0) return raw;                       // key absent: leave bytes untouched
+  const out = raw.slice();
+  new DataView(out.buffer, out.byteOffset, out.byteLength).setUint32(4, idx + 1);
+  return out;
+}
+
+/**
+ * Build a `meta` box holding `tags` plus everything worth preserving from
+ * `source` (a container descriptor from parseExistingIlst, or null when the
+ * file had no metadata). `targetFormat` is 'mdir' or 'mdta'.
+ *
+ * When `source` is given, its own handler decides whether its entries are
+ * "converting" (an mdir container being rewritten as mdta drops its ©-atoms,
+ * and vice versa), and its layout (ISO FullBox vs bare QuickTime) is kept.
+ *
+ * @returns {{ bytes: Uint8Array, preserved: number }}
+ */
+function buildMetaBox(source, tags, targetFormat) {
+  let metaBody;
+  let preserved = 0;
+  if (targetFormat === 'mdta') {
+    const keys = source ? source.keys.slice() : [];
+    const entries = buildMdtaEntries(tags);
+    // Register every key the new entries need *before* emitting any index, so
+    // a preserved entry can be rebased against the final keys table.
+    for (const e of entries) if (!keys.includes(e.key)) keys.push(e.key);
+    const rawEntries = [];
+    if (source) {
+      // Only discard mdir-style atoms when actually converting mdir -> mdta.
+      // Freeform (----) entries and unknown entries are always preserved.
+      const convertingFromMdir = source.hdlrType !== 'mdta';
+      for (const e of source.entries) {
+        if (!e.keyValue && convertingFromMdir && e.name.charCodeAt(0) === 0xa9) continue;
+        if (e.keyValue && entries.some((n) => n.key === e.keyValue)) continue; // key we override
+        // A numeric index is relative to that container's own keys table; a
+        // merged table renumbers it, so the raw index must be rebased.
+        rawEntries.push(e.keyValue ? remapMdtaEntryIndex(e.raw, e.keyValue, keys) : e.raw);
+        preserved++;
+      }
+    }
+    const ilstChildren = entries.map((e) => {
+      const idx = keys.indexOf(e.key);
+      return mp4Data(String.fromCharCode(0, 0, 0, idx + 1), e.value);
+    });
+    const ilst = mp4Box('ilst', cat([...rawEntries, ...ilstChildren]));
+    metaBody = cat([buildHdlr('mdta'), buildKeysBox(keys), ilst,
+      ...(source ? source.extraMetaChildren : [])]);
+  } else {
+    const entries = buildMdirEntries(tags);
+    const rawEntries = [];
+    if (source) {
+      for (const e of source.entries) {
+        // mdir cannot express a numeric-index (mdta) entry
+        if (e.name.charCodeAt(0) === 0 && e.name.charCodeAt(1) === 0 && e.name.charCodeAt(2) === 0) continue;
+        if (entries.some((n) => n.name === e.name)) continue; // idempotent: same-name entry replaced
+        rawEntries.push(e.raw);
+        preserved++;
+      }
+    }
+    const ilst = mp4Box('ilst', cat([...rawEntries, ...entries.map((e) => e.box)]));
+    metaBody = cat([buildHdlr('mdir'), ilst, ...(source ? source.extraMetaChildren : [])]);
+  }
+  // ISO FullBox by default; a container found in the bare QuickTime form is
+  // written back exactly as it was found.
+  const iso = !source || source.versionFlags !== false;
+  return { bytes: iso ? mp4FullBox('meta', 0, 0, metaBody) : mp4Box('meta', metaBody), preserved };
+}
+
+/**
+ * Replace the `meta` child of a udta box, keeping its other children (padding,
+ * vendor boxes) and its position. Used when a container must be updated in
+ * place rather than merged into one appended udta.
+ */
+function replaceUdtaMeta(bytes, udta, metaBytes) {
+  const kids = listChildrenEx(bytes, udta.pos + 8, udta.end).children;
+  const parts = kids.map((k) => (k.type === 'meta' ? metaBytes : bytes.slice(k.pos, k.end)));
+  return mp4Box('udta', cat(parts));
+}
+
+/**
+ * Wrap meta inside udta, padded with a free box so that the total udta size
+ * is a multiple of 8. This ensures the moov growth is 8-aligned, so mdat
+ * does not become misaligned (some legacy players / hardware decoders are
+ * sensitive to sample data alignment).
+ */
+function wrapUdta(metaBytes) {
+  let inner = metaBytes;
+  const pad = (8 - ((8 + inner.length) % 8)) % 8;
+  if (pad) inner = cat([inner, mp4Box('free', new Uint8Array(pad))]);
+  return mp4Box('udta', inner);
+}
+
+function buildHdlr(handlerType) {
+  // version/flags(4) pre_defined(4) handler_type(4) reserved(12) name(\0)
+  const body = cat([new Uint8Array(8), utf8(handlerType), new Uint8Array(12), new Uint8Array([0])]);
+  return mp4Box('hdlr', body);
+}
+
+function buildKeysBox(keys) {
+  const entries = keys.map((k) => {
+    const name = utf8(k);
+    const e = new Uint8Array(8 + name.length);
+    new DataView(e.buffer).setUint32(0, e.length);
+    e.set(utf8('mdta'), 4);
+    e.set(name, 8);
+    return e;
+  });
+  const body = new Uint8Array(4 + entries.reduce((a, e) => a + e.length, 0));
+  new DataView(body.buffer).setUint32(0, entries.length);
+  let o = 4;
+  for (const e of entries) { body.set(e, o); o += e.length; }
+  return mp4FullBox('keys', 0, 0, body);
+}
+
+/* ===========================================================================
+ * 3b. MPF (CIPA DC-007): motion-photo / multi-picture index in APP2
+ *
+ * A "dynamic photo" (vivo/OPPO/xiaomi motion photo, MPO stereo or HDR pair,
+ * depth/bokeh second frame) is one JPEG header plus a secondary payload
+ * appended after the primary image. The APP2 MPF segment indexes it with a
+ * table of *absolute* file offsets:
+ *
+ *   APP2 "MPF\0"  <byte-order mark>  MP-offset-to-IFD
+ *     IFD tag 0xB002 (MPEntry), 16 bytes per individual image:
+ *       +0 attribute | +4 image length | +8 image data offset | +12 dep. entries
+ *
+ * Those lengths and offsets are the JPEG counterpart of MP4's stco/co64: the
+ * moment the header changes length, every value must be rebased or the
+ * secondary payload silently becomes unreachable. Only the MPEntry table
+ * lives in the rewrite set, so the secondary payload never enters the heap.
+ * ========================================================================= */
+
+const MPF_MAGIC = [0x4d, 0x50, 0x46, 0x00];   // "MPF\0"
+const MPF_ENTRY_TAG = 0xb002;
+const SEG_HDR = 4;                             // FF E2 + 2-byte length
+
+/** Cheap check on an APP2 payload: "MPF\0" plus room for header + IFD entry. */
+function looksLikeMpf(b, pos, segLen) {
+  if (segLen < 2 + 14) return false;
+  for (let i = 0; i < 4; i++) if (b[pos + 4 + i] !== MPF_MAGIC[i]) return false;
+  return true;
+}
+
+/**
+ * Parse an MPF APP2 segment.
+ *
+ * The MP header is "MPF\0" followed immediately by a TIFF byte-order mark
+ * (the version lives in IFD tag 0xB000, not in the header). A few tools emit
+ * an extra version field before the byte-order mark, so both positions are
+ * attempted — the real-world layout first — and the first one that yields a
+ * consistent IFD wins.
+ *
+ * Offsets in MPEntry are defined relative to the byte-order mark. A few
+ * non-conforming writers store file-absolute offsets instead, so the base is
+ * chosen by validating every entry against the file size rather than by
+ * trusting the spec.
+ *
+ * @param seg        full segment bytes (0xFF 0xE2 lenHi lenLo payload...)
+ * @param segStartAbs absolute position of seg[0] in the file
+ * @param fileSize   total file size, used to validate the offset base
+ */
+export function parseMpf(seg, segStartAbs, fileSize) {
+  const segLen = u16(seg, 2);
+  if (seg.length < segLen + 2) throw new Error('MPF segment is truncated');
+  if (segLen + 2 < 4 + 14) throw new Error('MPF segment is too small to hold an index');
+  const tried = [];
+  for (const bomPos of [SEG_HDR + 4, SEG_HDR + 8]) {
+    try {
+      return parseMpfAt(seg, segLen, segStartAbs, fileSize, bomPos);
+    } catch (e) {
+      tried.push(e.message);
+    }
+  }
+  throw fail('MPF_INVALID', `MPF index could not be parsed (${tried.join('; ')})`);
+}
+
+function parseMpfAt(seg, segLen, segStartAbs, fileSize, e) {
+  if (e + 8 > seg.length) throw new Error('MPF byte-order mark is outside the segment');
+  const be = seg[e] === 0x4d && seg[e + 1] === 0x4d;
+  const le = seg[e] === 0x49 && seg[e + 1] === 0x49;
+  if (!be && !le) throw new Error('MPF byte-order mark not found');
+  if (be && !(seg[e + 2] === 0x00 && seg[e + 3] === 0x2a)) throw new Error('MPF byte-order mark not found');
+  if (le && !(seg[e + 2] === 0x2a && seg[e + 3] === 0x00)) throw new Error('MPF byte-order mark not found');
+
+  const r16 = be ? (o) => u16(seg, o) : (o) => ((seg[o + 1] << 8) | seg[o]) >>> 0;
+  const r32 = be ? (o) => u32(seg, o)
+    : (o) => (((seg[o + 3] << 24) | (seg[o + 2] << 16) | (seg[o + 1] << 8) | seg[o]) >>> 0);
+
+  const end = segLen + 2;
+  const ifd = e + r32(e + 4);
+  if (ifd + 2 > end) throw new Error('MPF IFD offset is outside the segment');
+  const ifdCount = r16(ifd);
+  if (ifdCount < 1 || ifd + 2 + ifdCount * 12 > end) throw new Error('MPF IFD is malformed');
+
+  let entriesOffset = -1, n = 0;
+  for (let i = 0; i < ifdCount; i++) {
+    const p = ifd + 2 + i * 12;
+    if (r16(p) !== MPF_ENTRY_TAG) continue;
+    if (r16(p + 2) !== 7) throw new Error('MPF MPEntry is not of undefined type');
+    const cnt = r32(p + 4);
+    if (cnt % 16 !== 0) throw new Error('MPF MPEntry count is not a multiple of 16');
+    n = cnt / 16;
+    entriesOffset = cnt <= 4 ? p + 8 : e + r32(p + 8);
+    break;
+  }
+  if (entriesOffset < 0 || n < 1) throw new Error('MPF MPEntry table not found');
+  if (n > 64) throw new Error(`MPF declares an implausible image count (${n})`);
+  if (entriesOffset + n * 16 > end) throw new Error('MPF MPEntry table runs outside the segment');
+
+  const raw = [];
+  for (let i = 0; i < n; i++) {
+    const p = entriesOffset + i * 16;
+    raw.push({ attr: r32(p), size: r32(p + 4), dataOffset: r32(p + 8) });
+  }
+  const fits = (base) => raw.every((en) => {
+    const s = en.dataOffset === 0 ? 0 : base + en.dataOffset;
+    return s >= 0 && s + en.size <= fileSize;
+  });
+  let baseAbs = segStartAbs + e, baseKind = 'mpEndian';
+  if (!fits(baseAbs)) {
+    if (fits(0)) { baseAbs = 0; baseKind = 'fileStart'; }
+    else throw fail('MPF_INVALID', 'MPF image offsets point outside the file');
+  }
+
+  return {
+    be, baseAbs, baseKind, entriesOffset, segLen: end,
+    entries: raw.map((en) => ({
+      attr: en.attr,
+      size: en.size,
+      dataOffset: en.dataOffset,
+      // Individual image 1 (offset 0) starts at the beginning of the file.
+      primary: en.dataOffset === 0,
+      startAbs: en.dataOffset === 0 ? 0 : baseAbs + en.dataOffset,
+    })),
+  };
+}
+
+/** Position map for an edit list: original file position -> output position. */
+/**
+ * Map a position in the *input* to the corresponding position in the *output*.
+ *
+ * Handles all three edit shapes: removals (bytes: empty), insertions
+ * (start === end) and replacements (start < end with bytes) — the EXIF segment
+ * is a replacement, so "insertions only" would have silently mis-rebased the
+ * MPF index.
+ */
+function makePosMap(edits) {
+  return (p) => {
+    let q = p;
+    for (const e of edits) {
+      if (e.start > p) continue;                          // starts after p: no effect
+      const added = e.bytes ? e.bytes.length : 0;
+      const removed = e.end - e.start;
+      if (e.end <= p) { q += added - removed; continue; } // ends at/before p: shift
+      q += added - Math.min(removed, p - e.start);        // p is inside the range
+    }
+    return q;
+  };
+}
+
+/**
+ * Rebase MPEntry lengths/offsets through a position map. Returns the patched
+ * segment bytes (same length as the input) or null when nothing changes.
+ * Throws when a value would overflow 32 bits — refusing beats corrupting.
+ */
+export function rebaseMpf(seg, parsed, map) {
+  const out = seg.slice();
+  const put32 = parsed.be
+    ? (o, v) => {
+      out[o] = (v >>> 24) & 0xff; out[o + 1] = (v >>> 16) & 0xff;
+      out[o + 2] = (v >>> 8) & 0xff; out[o + 3] = v & 0xff;
+    }
+    : (o, v) => {
+      out[o] = v & 0xff; out[o + 1] = (v >>> 8) & 0xff;
+      out[o + 2] = (v >>> 16) & 0xff; out[o + 3] = (v >>> 24) & 0xff;
+    };
+
+  const newBase = map(parsed.baseAbs);
+  let changed = 0;
+  parsed.entries.forEach((en, i) => {
+    const newStart = map(en.startAbs);
+    // A length is a distance, so it follows the mapping of its own end —
+    // that stays correct even when the region contains the edited header.
+    const newSize = map(en.startAbs + en.size) - newStart;
+    const newRel = en.primary ? 0 : newStart - newBase;
+    if (!(newSize > 0) || newSize > 0xffffffff)
+      throw fail('MPF_INVALID', `MPF image ${i + 1}: length overflows 32 bits after header change`);
+    if (newRel < 0 || newRel > 0xffffffff)
+      throw fail('MPF_INVALID', `MPF image ${i + 1}: offset overflows 32 bits after header change`);
+    if (newSize === en.size && newRel === en.dataOffset) return;
+    const p = parsed.entriesOffset + i * 16;
+    put32(p + 4, newSize);
+    put32(p + 8, newRel);
+    changed++;
+  });
+  return changed ? out : null;
+}
+
+/* ===========================================================================
+ * 4. JPEG planner: reads only the file header
+ * ========================================================================= */
+
+async function scanJpeg(src, report, seed) {
+  const MAX_HEAD = 8 << 20;
+  let cap = Math.min(64 << 10, src.size);
+  for (;;) {
+    const head = await readHeadAt(src, cap, seed);
+    const r = scanJpegHead(head, src.size);
+    if (r.ok) return { head, ...r };
+    if (!r.needMore || cap >= MAX_HEAD || cap >= src.size) {
+      throw fail('MALFORMED_CONTAINER', 'Could not locate JPEG segment insertion point in file header' + (r.reason ? ': ' + r.reason : ''));
+    }
+    cap = Math.min(MAX_HEAD, Math.max(cap * 4, r.needTo));
+    report.notes.push(`JPEG header scan extended to ${cap} bytes`);
+  }
+}
+
+function scanJpegHead(b, fileSize) {
+  if (b.length < 4) return { ok: false, needMore: true, needTo: 4 };
+  if (b[0] !== 0xff || b[1] !== 0xd8) return { ok: false, reason: 'not a JPEG (missing SOI)' };
+  let pos = 2, insertAt = -1;
+  const removes = [];
+  const extRemoves = [];
+  const mpf = [];
+  const exif = [];
+  while (pos + 2 <= b.length) {
+    if (b[pos] !== 0xff) return { ok: false, reason: `offset ${pos} is not a marker` };
+    const marker = b[pos + 1];
+    if (marker === 0xff) { pos += 1; continue; }                       // fill bytes
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { pos += 2; continue; } // no length
+    if (marker === 0xd8 || marker === 0xd9) { pos += 2; continue; }
+    if (pos + 4 > b.length) return { ok: false, needMore: true, needTo: pos + 4 };
+    const segLen = u16(b, pos + 2);
+    if (segLen < 2) return { ok: false, reason: 'invalid segment length' };
+    const segEnd = pos + 2 + segLen;
+    if (segEnd > fileSize) return { ok: false, reason: 'segment length exceeds file size' };
+    if (marker === 0xe1) {   // APP1: EXIF, standard XMP, or an Extended XMP fragment
+      if (segEnd > b.length) return { ok: false, needMore: true, needTo: segEnd };
+      if (payloadIsNs(b, pos + 4, 'Exif')) exif.push({ start: pos, end: segEnd });
+      else if (segLen >= 2 + XMP_NS.length + 1 && payloadIsNs(b, pos + 4, XMP_NS)) {
+        removes.push({ start: pos, end: segEnd });
+      } else if (segLen >= 2 + XMP_EXT_NS.length + 1 && payloadIsNs(b, pos + 4, XMP_EXT_NS)) {
+        extRemoves.push({ start: pos, end: segEnd });
+      }
+    }
+    if (marker >= 0xe0 && marker <= 0xef || marker === 0xfe) {
+      if (segEnd > b.length) return { ok: false, needMore: true, needTo: segEnd };
+      // APP2 may carry the motion-photo / multi-picture index (MPF). Its bytes
+      // are needed later for rebasing, so the whole segment must be in window.
+      if (marker === 0xe2 && looksLikeMpf(b, pos, segLen)) mpf.push({ start: pos, end: segEnd });
+      pos = segEnd; continue;                                          // APPn / COM: skip
+    }
+    insertAt = pos;                                                    // DQT/SOF/DHT/SOS: insert before it
+    break;
+  }
+  if (insertAt === -1) {
+    if (pos >= b.length) return { ok: false, needMore: true, needTo: Math.min(fileSize, b.length * 4) };
+    return { ok: false, reason: 'SOS/SOF marker not found' };
+  }
+  return { ok: true, insertAt, removes, extRemoves, mpf, exif };
+}
+
+/* ===========================================================================
+ * 4a. EXIF (TIFF) — native fields for OS property sheets
+ *
+ * Windows Explorer's "Properties → Details" reads the native TIFF fields on
+ * builds that ignore XMP, so an XMP-only JPEG can still look untagged there.
+ * This module mirrors the caller's tags into IFD0 (and UserComment into the
+ * ExifIFD) for JPEG, and into PNG's `eXIf` chunk.
+ *
+ * Every offset inside a TIFF block is relative to the TIFF header, which makes a
+ * safe update possible without understanding the whole structure: the IFD being
+ * changed is *rebuilt at the end of the block* and its pointer updated. Nothing
+ * else moves, so GPS, the ExifIFD, IFD1/thumbnail and vendor MakerNotes keep
+ * both their bytes and their offsets — including structures with undocumented
+ * internal offsets that a full parse/re-serialize would break.
+ * ========================================================================= */
+
+const EXIF_PREFIX = 'Exif\0\0';
+const EXIF_PREFIX_LEN = 6;
+/**
+ * IFD0 tags mirrored from the caller's fields.
+ *
+ * Deliberately *not* mirrored:
+ *   - `software` → 0x0131 holds the software that created the image, i.e. the
+ *     camera firmware ("MediaTek Camera Application"). Overwriting it would
+ *     destroy that record for a field that means something else (XMP
+ *     `CreatorTool`), so it stays XMP-only.
+ *   - `date` → the ExifIFD tag DateTimeOriginal (0x9003) is the real capture
+ *     time and is exactly what Explorer shows as "Date taken"; replacing it
+ *     with a caller-supplied date would rewrite history. Only IFD0's DateTime
+ *     (0x0132) is mirrored.
+ *   - `url` / `keywords` → no EXIF home; they stay XMP-only.
+ */
+const IFD0_TEXT_TAGS = { title: 0x010e, artist: 0x013b, copyright: 0x8298 };
+const TAG_IFD0_DATETIME = 0x0132;          // DateTime ("YYYY:MM:DD HH:MM:SS")
+const TAG_EXIF_IFD_POINTER = 0x8769;       // IFD0 → ExifIFD
+const TAG_EXIF_VERSION = 0x9000;           // ExifIFD ExifVersion
+const TAG_USER_COMMENT = 0x9286;           // ExifIFD UserComment (= Explorer "Comments")
+const TIFF_TYPE_ASCII = 2;
+const TIFF_TYPE_UNDEFINED = 7;
+const TIFF_TYPE_LONG = 4;
+const TIFF_TYPE_WIDTH = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8 };
+
+const tiffU16 = (b, o, le) => (le ? (b[o] | (b[o + 1] << 8)) : ((b[o] << 8) | b[o + 1]));
+const tiffU32 = (b, o, le) => (le
+  ? ((b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0)
+  : (((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0));
+function tiffPutU16(b, o, v, le) {
+  if (le) { b[o] = v & 0xff; b[o + 1] = (v >> 8) & 0xff; }
+  else { b[o] = (v >> 8) & 0xff; b[o + 1] = v & 0xff; }
+}
+function tiffPutU32(b, o, v, le) {
+  if (le) { b[o] = v & 0xff; b[o + 1] = (v >>> 8) & 0xff; b[o + 2] = (v >>> 16) & 0xff; b[o + 3] = (v >>> 24) & 0xff; }
+  else { b[o] = (v >>> 24) & 0xff; b[o + 1] = (v >>> 16) & 0xff; b[o + 2] = (v >>> 8) & 0xff; b[o + 3] = v & 0xff; }
+}
+/** UTF-16LE code units (surrogate pairs pass through unchanged). */
+function utf16le(s) {
+  const out = new Uint8Array(s.length * 2);
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    out[i * 2] = c & 0xff;
+    out[i * 2 + 1] = (c >> 8) & 0xff;
+  }
+  return out;
+}
+
+/** ISO-8601 → EXIF "YYYY:MM:DD HH:MM:SS" (the wall-clock time as written). */
+function toExifDateTime(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/.exec(String(value ?? '').trim());
+  return m ? `${m[1]}:${m[2]}:${m[3]} ${m[4]}:${m[5]}:${m[6]}` : null;
+}
+
+/**
+ * EXIF UserComment is an UNDEFINED value starting with an 8-byte character
+ * code. Plain ASCII stays ASCII; anything else is UTF-16LE **with a BOM** —
+ * without the BOM readers guess the byte order (exiftool assumes big-endian)
+ * and the text comes back as mojibake.
+ */
+function encodeUserComment(text) {
+  const ascii = /^[\x20-\x7e]*$/.test(text);
+  const body = ascii ? utf8(text) : cat([new Uint8Array([0xff, 0xfe]), utf16le(text)]);
+  return cat([utf8(ascii ? 'ASCII\0\0\0' : 'UNICODE\0'), body]);
+}
+/**
+ * The text an existing UserComment value carries (best effort).
+ *
+ * A conforming writer prefixes the value with an 8-byte character code, but
+ * MediaTek/vivo phones write a bare ASCII string ("filter: 0; module: …") with
+ * no prefix at all. Anything unrecognised is therefore treated as text rather
+ * than as an empty value — mistaking camera data for "empty" is exactly how a
+ * write would destroy it.
+ */
+function decodeUserComment(bytes) {
+  const strip = (s) => s.replace(/\0+$/, '').trim();
+  if (!bytes.length) return '';
+  const code = new TextDecoder().decode(bytes.subarray(0, 8));
+  if (code === 'ASCII\0\0\0') return strip(new TextDecoder().decode(bytes.subarray(8)));
+  if (code === 'JIS\0\0\0\0\0') return strip(new TextDecoder().decode(bytes.subarray(8)));
+  if (code === 'UNICODE\0') {
+    const body = bytes.subarray(8);
+    if (!body.length) return '';
+    const be = body[0] === 0xfe && body[1] === 0xff;
+    const le = body[0] === 0xff && body[1] === 0xfe;
+    if (be) return strip(new TextDecoder('utf-16be').decode(body.subarray(2)));
+    return strip(new TextDecoder('utf-16le').decode(le ? body.subarray(2) : body));
+  }
+  return strip(new TextDecoder().decode(bytes));      // no/unknown code: treat as text
+}
+
+/**
+ * The native fields the caller asked for.
+ *
+ * `dateTime` is off for PNG: the format has its own canonical place for the
+ * creation time (`Creation Time` text chunk, which we already write), and an
+ * EXIF date in eXIf is flagged by validators as a non-standard PNG date.
+ */
+function nativeExifFields(tags, { dateTime = true } = {}) {
+  const t = normalizeTags(tags);
+  const ifd0 = [];
+  for (const [field, tag] of Object.entries(IFD0_TEXT_TAGS)) {
+    if (String(t[field]).length) ifd0.push({ tag, value: String(t[field]) });
+  }
+  const dt = dateTime && t.date ? toExifDateTime(t.date) : null;
+  if (dt) ifd0.push({ tag: TAG_IFD0_DATETIME, value: dt });
+  ifd0.sort((a, b) => a.tag - b.tag);
+  const comment = String(t.comment).length ? String(t.comment) : null;
+  return { ifd0, comment };
+}
+
+/** Read one IFD. Returns null when it does not sit inside the block. */
+function readTiffIfd(tiff, offset, le) {
+  if (offset < 8 || offset + 2 > tiff.length) return null;
+  const count = tiffU16(tiff, offset, le);
+  const end = offset + 2 + count * 12 + 4;
+  if (count > 4096 || end > tiff.length) return null;
+  const entries = [];
+  for (let i = 0; i < count; i++) {
+    const at = offset + 2 + i * 12;
+    const type = tiffU16(tiff, at + 2, le);
+    const n = tiffU32(tiff, at + 4, le);
+    const width = TIFF_TYPE_WIDTH[type];
+    entries.push({ at, tag: tiffU16(tiff, at, le), type, count: n, byteLen: width ? width * n : -1 });
+  }
+  return { offset, entries, next: tiffU32(tiff, offset + 2 + count * 12, le), end };
+}
+
+/** Value bytes of an entry, or null when they are not addressable. */
+function readTiffValue(tiff, entry, le) {
+  if (entry.byteLen < 0) return null;
+  if (entry.byteLen <= 4) return tiff.slice(entry.at + 8, entry.at + 8 + entry.byteLen);
+  const off = tiffU32(tiff, entry.at + 8, le);
+  if (off + entry.byteLen > tiff.length) return null;
+  return tiff.slice(off, off + entry.byteLen);
+}
+
+/** The text an ASCII entry currently holds (trailing NULs stripped). */
+function readTiffAscii(tiff, entry, le) {
+  if (entry.type !== TIFF_TYPE_ASCII) return null;
+  const raw = readTiffValue(tiff, entry, le);
+  return raw ? new TextDecoder().decode(raw).replace(/\0+$/, '') : null;
+}
+
+/**
+ * Append-and-repoint writer: collects new bytes after the existing TIFF block
+ * and hands back the offsets they landed at, keeping the block word-aligned.
+ */
+function tiffAppender(baseLength) {
+  const chunks = [];
+  let cursor = baseLength;
+  return {
+    add(bytes) {
+      if (cursor % 2) { chunks.push(new Uint8Array(1)); cursor += 1; }
+      const at = cursor;
+      chunks.push(bytes);
+      cursor += bytes.length;
+      return at;
+    },
+    bytes: () => chunks,
+  };
+}
+
+/** Serialize an IFD: ascending tags, 12-byte entries, next-IFD pointer. */
+function writeTiffIfd(le, entries, next) {
+  const out = new Uint8Array(2 + entries.length * 12 + 4);
+  tiffPutU16(out, 0, entries.length, le);
+  entries.forEach((e, i) => {
+    const at = 2 + i * 12;
+    if (e.raw) { out.set(e.raw, at); return; }
+    tiffPutU16(out, at, e.tag, le);
+    tiffPutU16(out, at + 2, e.type, le);
+    tiffPutU32(out, at + 4, e.count, le);
+    if (e.inline) out.set(e.inline, at + 8);
+    else tiffPutU32(out, at + 8, e.valueOffset, le);
+  });
+  tiffPutU32(out, 2 + entries.length * 12, next, le);
+  return out;
+}
+
+/** Turn [{tag,type,bytes}] into IFD entries, storing short values inline. */
+function valueEntries(fields, appender) {
+  return fields.map((f) => (f.bytes.length <= 4
+    ? { tag: f.tag, type: f.type, count: f.bytes.length, inline: f.bytes }
+    : { tag: f.tag, type: f.type, count: f.bytes.length, valueOffset: appender.add(f.bytes) }));
+}
+
+/** Ascending-tag order, whether the entry is raw or rebuilt. */
+function sortEntries(entries, le) {
+  return entries.sort((a, b) => (a.tag ?? tiffU16(a.raw, 0, le)) - (b.tag ?? tiffU16(b.raw, 0, le)));
+}
+
+/**
+ * Rebuild the IFD0 of a TIFF block with the caller's fields (and the ExifIFD,
+ * when UserComment needs writing), appending everything at the end of the block
+ * and updating only the pointer that reaches it.
+ *
+ * @returns {{ tiff: Uint8Array, changed: number[] }|null} null when nothing differs
+ */
+function buildExifTiff(tiff, wants) {
+  if (tiff.length < 8) throw fail('EXIF_UNPARSEABLE', 'EXIF block is too short for a TIFF header');
+  const le = tiff[0] === 0x49 && tiff[1] === 0x49;
+  const be = tiff[0] === 0x4d && tiff[1] === 0x4d;
+  if (!le && !be) throw fail('EXIF_UNPARSEABLE', 'EXIF block has no TIFF byte-order mark');
+  if (tiffU16(tiff, 2, le) !== 42) throw fail('EXIF_UNPARSEABLE', 'EXIF TIFF magic is not 42');
+  const ifd0 = readTiffIfd(tiff, tiffU32(tiff, 4, le), le);
+  if (!ifd0) throw fail('EXIF_UNPARSEABLE', 'EXIF IFD0 is outside the EXIF block');
+
+  const changed = wants.ifd0.filter((f) => {
+    const e = ifd0.entries.find((x) => x.tag === f.tag);
+    return !e || readTiffAscii(tiff, e, le) !== f.value;
+  });
+
+  // UserComment lives in the ExifIFD, reached through IFD0 tag 0x8769.
+  const pointer = ifd0.entries.find((e) => e.tag === TAG_EXIF_IFD_POINTER);
+  const exifIfd = pointer ? readTiffIfd(tiff, tiffU32(tiff, pointer.at + 8, le), le) : null;
+  // UserComment is only *filled in*, never overwritten: phone vendors park their
+  // processing parameters there ("filter: 0; module: portrait; …"), which is not
+  // a comment and would be destroyed by treating the tag as ours.
+  let wantsComment = false;
+  let commentBlocked = false;
+  if (wants.comment) {
+    const e = exifIfd ? exifIfd.entries.find((x) => x.tag === TAG_USER_COMMENT) : null;
+    const cur = e ? decodeUserComment(readTiffValue(tiff, e, le) || new Uint8Array(0)).trim() : '';
+    if (!cur) wantsComment = true;                        // absent or empty: ours to fill
+    else if (cur !== wants.comment.trim()) commentBlocked = true; // someone else's data: keep it
+  }
+  if (!changed.length && !wantsComment) {
+    return commentBlocked ? { skipped: true, commentBlocked } : null;
+  }
+
+  const appender = tiffAppender(tiff.length);
+  let newExifIfdOffset = null;
+  if (wantsComment) {
+    // Rebuild the ExifIFD (or create a minimal one) and repoint IFD0 at it.
+    const entries = [];
+    if (exifIfd) {
+      for (const e of exifIfd.entries) {
+        if (e.tag === TAG_USER_COMMENT) continue;
+        entries.push({ tag: e.tag, raw: tiff.slice(e.at, e.at + 12) });
+      }
+    } else {
+      entries.push({ tag: TAG_EXIF_VERSION, type: TIFF_TYPE_UNDEFINED, count: 4, inline: utf8('0232') });
+    }
+    entries.push(...valueEntries([{ tag: TAG_USER_COMMENT, type: TIFF_TYPE_UNDEFINED, bytes: encodeUserComment(wants.comment) }], appender));
+    newExifIfdOffset = appender.add(writeTiffIfd(le, sortEntries(entries, le), exifIfd ? exifIfd.next : 0));
+  }
+
+  // Entries we do not touch are copied verbatim — that is what keeps GPS, the
+  // ExifIFD, the thumbnail and vendor blocks intact.
+  const keep = ifd0.entries
+    .filter((e) => !changed.some((c) => c.tag === e.tag))
+    .filter((e) => !(wantsComment && e.tag === TAG_EXIF_IFD_POINTER))
+    .map((e) => ({ tag: e.tag, raw: tiff.slice(e.at, e.at + 12) }));
+  const rebuilt = valueEntries(changed.map((f) => ({ tag: f.tag, type: TIFF_TYPE_ASCII, bytes: utf8(f.value + '\0') })), appender);
+  if (wantsComment) {
+    rebuilt.push({ tag: TAG_EXIF_IFD_POINTER, type: TIFF_TYPE_LONG, count: 1, valueOffset: newExifIfdOffset });
+  }
+  const newIfd0Offset = appender.add(writeTiffIfd(le, sortEntries([...keep, ...rebuilt], le), ifd0.next));
+
+  const out = cat([tiff, ...appender.bytes()]);
+  tiffPutU32(out, 4, newIfd0Offset, le);              // TIFF header → new IFD0
+  return { tiff: out, changed: changed.map((c) => c.tag), commentBlocked };
+}
+
+/** A minimal, spec-shaped TIFF built from scratch (the file had none). */
+function synthesizeTiff(wants) {
+  const le = false;                                   // big-endian, like most cameras
+  const ifd0Fields = wants.ifd0.map((f) => ({ tag: f.tag, type: TIFF_TYPE_ASCII, bytes: utf8(f.value + '\0') }));
+  if (wants.comment) ifd0Fields.push({ tag: TAG_EXIF_IFD_POINTER, type: TIFF_TYPE_LONG, count: 1 });
+  sortEntries(ifd0Fields, le);
+  const exifFields = wants.comment
+    ? [{ tag: TAG_EXIF_VERSION, type: TIFF_TYPE_UNDEFINED, count: 4, value: utf8('0232') },
+       { tag: TAG_USER_COMMENT, type: TIFF_TYPE_UNDEFINED, value: encodeUserComment(wants.comment) }]
+    : [];
+  exifFields.sort((a, b) => a.tag - b.tag);
+
+  const ifd0Size = 2 + ifd0Fields.length * 12 + 4;
+  const exifSize = exifFields.length ? 2 + exifFields.length * 12 + 4 : 0;
+  const exifAt = 8 + ifd0Size;
+  let cursor = exifAt + exifSize;
+  const chunks = [];
+  const place = (bytes) => {
+    if (cursor % 2) { chunks.push(new Uint8Array(1)); cursor += 1; }
+    const at = cursor; chunks.push(bytes); cursor += bytes.length; return at;
+  };
+  const ifd = new Uint8Array(ifd0Size);
+  tiffPutU16(ifd, 0, ifd0Fields.length, le);
+  ifd0Fields.forEach((e, i) => {
+    const at = 2 + i * 12;
+    tiffPutU16(ifd, at, e.tag, le);
+    tiffPutU16(ifd, at + 2, e.type, le);
+    if (e.tag === TAG_EXIF_IFD_POINTER) {
+      tiffPutU32(ifd, at + 4, 1, le);
+      tiffPutU32(ifd, at + 8, exifAt, le);
+      return;
+    }
+    tiffPutU32(ifd, at + 4, e.bytes.length, le);
+    if (e.bytes.length <= 4) { ifd.set(e.bytes, at + 8); return; }
+    tiffPutU32(ifd, at + 8, place(e.bytes), le);
+  });
+  tiffPutU32(ifd, 2 + ifd0Fields.length * 12, 0, le); // no IFD1
+
+  let exifIfd = new Uint8Array(0);
+  if (exifFields.length) {
+    exifIfd = new Uint8Array(exifSize);
+    tiffPutU16(exifIfd, 0, exifFields.length, le);
+    exifFields.forEach((e, i) => {
+      const at = 2 + i * 12;
+      tiffPutU16(exifIfd, at, e.tag, le);
+      tiffPutU16(exifIfd, at + 2, e.type, le);
+      tiffPutU32(exifIfd, at + 4, e.value.length, le);
+      if (e.value.length <= 4) { exifIfd.set(e.value, at + 8); return; }
+      tiffPutU32(exifIfd, at + 8, place(e.value), le);
+    });
+    tiffPutU32(exifIfd, 2 + exifFields.length * 12, 0, le);
+  }
+  return cat([new Uint8Array([0x4d, 0x4d]), new Uint8Array([0, 42]), u32be(8), ifd, exifIfd, ...chunks]);
+}
+const u32be = (n) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+
+/** `Exif\0\0` + TIFF, for a JPEG APP1 payload. */
+const asExifPayload = (tiff) => cat([utf8(EXIF_PREFIX), tiff]);
+
+/** Wrap an `Exif\0\0`+TIFF payload in an APP1 segment. */
+function wrapExifApp1(payload) {
+  const segLen = 2 + payload.length;
+  if (segLen > 0xffff) {
+    throw fail('EXIF_TOO_LARGE', 'EXIF block exceeds the JPEG single-segment 64KB limit');
+  }
+  const seg = new Uint8Array(2 + segLen);
+  seg[0] = 0xff; seg[1] = 0xe1;
+  seg[2] = (segLen >> 8) & 0xff; seg[3] = segLen & 0xff;
+  seg.set(payload, 4);
+  return seg;
+}
+
+/** Where a new EXIF APP1 belongs: after a leading APP0 (JFIF) when present. */
+function exifInsertPosition(head) {
+  const p = 2;
+  if (head.length >= 4 && head[p] === 0xff && head[p + 1] === 0xe0) {
+    const len = u16(head, p + 2);
+    if (len >= 2 && p + 2 + len <= head.length) return p + 2 + len;
+  }
+  return 2;
+}
+
+export async function planJpeg(src, tags, report, seed, opts = {}) {
+  const { head, insertAt, removes, extRemoves, mpf, exif } = await scanJpeg(src, report, seed);
+  const seg = buildXmpApp1(tags);
+  const edits = [];
+  for (const r of removes) {
+    edits.push({ start: r.start, end: r.end, bytes: new Uint8Array(0), what: 'replace existing XMP segment' });
+  }
+  // Extended XMP fragments become unreachable once the standard packet is
+  // replaced (the new packet never declares HasExtendedXMP). Leaving them
+  // behind would keep stale metadata — including descriptions and keywords the
+  // caller believes were overwritten — in the file.
+  for (const r of extRemoves) {
+    edits.push({ start: r.start, end: r.end, bytes: new Uint8Array(0), what: 'drop stale Extended XMP fragment' });
+  }
+  if (!removes.length && !extRemoves.length) report.notes.push('JPEG has no existing XMP; inserting new APP1 segment');
+  if (extRemoves.length) {
+    report.xmp = { replaced: removes.length, staleExtendedFragments: extRemoves.length };
+    report.notes.push(`removed ${extRemoves.length} stale Extended XMP fragment(s)`);
+  }
+  // Native EXIF IFD0: mirror the caller's fields so OS property sheets (which
+  // may ignore XMP entirely) show a Title/Author. Pushed before the MPF block so
+  // the position map accounts for the segment's size change.
+  if (opts.nativeExif !== false) {
+    const wants = nativeExifFields(tags);
+    if (wants.ifd0.length || wants.comment) {
+      try {
+        if (exif.length > 1) {
+          report.warnings.push(`${exif.length} Exif APP1 segments found; native EXIF fields were not written`);
+        } else if (exif.length === 1) {
+          // payload = everything after the marker + 2-byte length
+          const payload = head.subarray(exif[0].start + 4, exif[0].end);
+          const built = buildExifTiff(payload.subarray(EXIF_PREFIX_LEN), wants);
+          if (built) {
+            edits.push({
+              start: exif[0].start, end: exif[0].end,
+              bytes: wrapExifApp1(asExifPayload(built.tiff)), what: 'update EXIF',
+            });
+            report.exif = { updated: built.changed, userComment: !!wants.comment && !built.commentBlocked };
+            if (built.commentBlocked) {
+              report.notes.push('existing EXIF UserComment holds other data (e.g. camera parameters); kept it and used XMP for the comment');
+            }
+            report.notes.push(`EXIF IFD0 updated (${built.changed.length} tag(s): `
+              + `${built.changed.map((t) => '0x' + t.toString(16)).join(', ')})`);
+          } else {
+            report.notes.push('EXIF already holds the requested values; left untouched');
+          }
+        } else {
+          const at = exifInsertPosition(head);
+          edits.push({ start: at, end: at, bytes: wrapExifApp1(asExifPayload(synthesizeTiff(wants))), what: 'insert EXIF APP1' });
+          report.exif = { created: true, fields: wants.ifd0.map((f) => f.tag), userComment: !!wants.comment };
+          report.notes.push('file had no EXIF; created a minimal APP1 EXIF segment');
+        }
+      } catch (e) {
+        // The XMP packet still carries these fields, so a broken EXIF degrades to
+        // a warning instead of failing the whole write.
+        report.warnings.push(`native EXIF not updated: ${e.message}`);
+      }
+    }
+  }
+
+  edits.push({ start: insertAt, end: insertAt, bytes: seg, what: 'insert XMP APP1' });
+
+  // Motion photo / multi-picture: rebase the absolute offsets that index the
+  // secondary payload. A parse failure refuses the write instead of leaving a
+  // dangling index behind.
+  if (mpf && mpf.length) {
+    const map = makePosMap(edits);
+    let images = 0;
+    for (const m of mpf) {
+      const segBytes = head.subarray(m.start, m.end);
+      const parsed = parseMpf(segBytes, m.start, src.size);
+      const patched = rebaseMpf(segBytes, parsed, map);
+      images += parsed.entries.length;
+      if (patched) {
+        edits.push({ start: m.start, end: m.end, bytes: patched, what: 'rebase MPF multi-picture offsets' });
+      }
+    }
+    report.mpf = { segments: mpf.length, images, rebased: true };
+    report.notes.push(`MPF multi-picture index rebased (${images} individual image${images > 1 ? 's' : ''})`);
+  }
+  return { format: 'jpeg', edits, bytesReadFor: insertAt };
+}
+
+/* ===========================================================================
+ * 5. PNG planner: reads only the file header (between IHDR and IDAT)
+ * ========================================================================= */
+
+const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+async function scanPng(src, report, seed) {
+  const MAX_HEAD = 8 << 20;
+  let cap = Math.min(64 << 10, src.size);
+  for (;;) {
+    const head = await readHeadAt(src, cap, seed);
+    const r = scanPngHead(head, src.size);
+    if (r.ok) return { head, ...r };
+    if (!r.needMore || cap >= MAX_HEAD || cap >= src.size) {
+      throw fail('MALFORMED_CONTAINER', 'Could not locate PNG insertion point' + (r.reason ? ': ' + r.reason : ''));
+    }
+    cap = Math.min(MAX_HEAD, Math.max(cap * 4, r.needTo));
+    report.notes.push(`PNG header scan extended to ${cap} bytes`);
+  }
+}
+
+function scanPngHead(b, fileSize) {
+  for (let i = 0; i < 8; i++) if (b[i] !== PNG_SIG[i]) return { ok: false, reason: 'not a PNG (signature mismatch)' };
+  let pos = 8, insertAt = -1;
+  const removes = [];
+  const exif = [];
+  let exifTextChunks = 0;      // EXIF kept outside eXIf: ImageMagick 'Raw profile type APP1' or `exif:*` keys
+  while (pos + 8 <= b.length) {
+    const len = u32(b, pos);
+    const type = fourcc(b, pos + 4);
+    if (len > 0x7fffffff) return { ok: false, reason: 'invalid chunk length' };
+    const end = pos + 12 + len;
+    if (end > fileSize) return { ok: false, reason: 'chunk extends past file end' };
+    // IDAT / IEND: insertion point is the chunk start; the chunk body does
+    // not need to be read. This avoids loading a potentially huge IDAT into
+    // the buffer just to discover the insertion position.
+    if (type === 'IDAT' || type === 'IEND') { insertAt = pos; break; }
+    // Other chunk types: need the full chunk to scan for text blocks to remove
+    if (end > b.length) return { ok: false, needMore: true, needTo: end };
+    if (type === 'eXIf') exif.push({ start: pos, end, dataAt: pos + 8 });
+    if (type === 'iTXt' || type === 'tEXt' || type === 'zTXt') {
+      const kwEnd = b.indexOf(0, pos + 8);
+      if (kwEnd > -1 && kwEnd < end) {
+        const kw = new TextDecoder().decode(b.subarray(pos + 8, kwEnd));
+        if (kw.startsWith('exif:') || kw === 'Raw profile type APP1') exifTextChunks++;
+        if (PNG_OWN_KEYWORDS.has(kw)) removes.push({ start: pos, end, what: `replace existing chunk ${kw}` });
+      }
+    }
+    pos = end;
+  }
+  if (insertAt === -1) {
+    if (pos + 8 > b.length) return { ok: false, needMore: true, needTo: Math.min(fileSize, b.length * 4) };
+    return { ok: false, reason: 'IDAT/IEND not found' };
+  }
+  return { ok: true, insertAt, removes, exif, exifTextChunks };
+}
+
+export async function planPng(src, tags, report, seed, opts = {}) {
+  const { head, insertAt, removes, exif, exifTextChunks } = await scanPng(src, report, seed);
+  const chunks = buildPngTextChunks(tags);
+  if (!chunks) throw new Error('no writable tags provided');
+  const edits = removes.map((r) => ({ start: r.start, end: r.end, bytes: new Uint8Array(0), what: r.what }));
+
+  // Native EXIF travels in the `eXIf` chunk (a bare TIFF block, no "Exif\0\0").
+  if (opts.nativeExif !== false) {
+    const wants = nativeExifFields(tags, { dateTime: false });
+    if (wants.ifd0.length || wants.comment) {
+      try {
+        if (exif.length > 1) {
+          report.warnings.push(`${exif.length} eXIf chunks found; native EXIF fields were not written`);
+        } else if (exif.length === 1) {
+          const built = buildExifTiff(head.subarray(exif[0].dataAt, exif[0].end), wants);
+          if (built) {
+            edits.push({ start: exif[0].start, end: exif[0].end,
+              bytes: pngChunk('eXIf', built.tiff), what: 'update eXIf chunk' });
+            report.exif = { updated: built.changed, userComment: !!wants.comment && !built.commentBlocked };
+            report.notes.push(`eXIf chunk updated (${built.changed.length} tag(s))`);
+            if (built.commentBlocked) {
+              report.notes.push('existing eXIf UserComment holds other data; kept it and used XMP for the comment');
+            }
+          } else {
+            report.notes.push('eXIf already holds the requested values; left untouched');
+          }
+        } else {
+          edits.push({ start: insertAt, end: insertAt,
+            bytes: pngChunk('eXIf', synthesizeTiff(wants)), what: 'insert eXIf chunk' });
+          report.exif = { created: true, fields: wants.ifd0.map((f) => f.tag), userComment: !!wants.comment };
+          report.notes.push('file had no eXIf; created one');
+        }
+      } catch (e) {
+        report.warnings.push(`native EXIF not updated: ${e.message}`);
+      }
+    }
+  }
+
+  if (exifTextChunks) {
+    // ImageMagick stores the whole EXIF APP1 as `Raw profile type APP1`, and some
+    // older writers use `exif:*` keys. Both are EXIF outside the eXIf chunk, and
+    // readers that prefer them (exiftool does) will keep showing the old values.
+    report.warnings.push(`this PNG already carries EXIF outside the eXIf chunk `
+      + `(${exifTextChunks} text chunk(s): ImageMagick "Raw profile type APP1" or "exif:*"); `
+      + 'the new fields went to eXIf and XMP, but readers that prefer those chunks may show the old ones');
+  }
+
+  edits.push({ start: insertAt, end: insertAt, bytes: chunks, what: 'insert iTXt text chunks' });
+  return { format: 'png', edits, bytesReadFor: insertAt };
+}
+
+/* ===========================================================================
+ * 6. MP4 planner: reads only box headers + moov
+ * ========================================================================= */
+
+export async function probeMp4(src, seed) {
+  const win = new HeaderWindow(src, 65536, seed);
+  const boxes = [];
+  let pos = 0, guard = 0;
+  while (pos + 8 <= src.size) {
+    if (++guard > 100000) throw new Error('abnormal number of top-level boxes');
+    const w = await win.header(pos);
+    if (!w) break;
+    const { buf, off } = w;
+    let size = u32(buf, off), headerSize = 8;
+    const type = fourcc(buf, off + 4);
+    if (size === 1) {
+      if (off + 16 > buf.length) { throw new Error('largesize header spans window boundary; increase window size'); }
+      headerSize = 16;
+      size = u64(buf, off + 8);
+    } else if (size === 0) {
+      size = src.size - pos;
+    }
+    if (size < headerSize || pos + size > src.size) {
+      throw fail('MALFORMED_CONTAINER', `box ${type}@${pos} has invalid size (${size})`);
+    }
+    boxes.push({ pos, size, headerSize, type, end: pos + size });
+    pos += size;
+  }
+  const moov = boxes.find((b) => b.type === 'moov');
+  const mdat = boxes.find((b) => b.type === 'mdat');
+  const ftyp = boxes.find((b) => b.type === 'ftyp');
+  const free = boxes.filter((b) => b.type === 'free' || b.type === 'skip');
+  const moofs = boxes.filter((b) => b.type === 'moof' || b.type === 'sidx');
+  return {
+    boxes, moov, mdat, ftyp, free, moofs,
+    complete: pos >= src.size,
+    hasFragments: moofs.length > 0,
+    fastStart: !!(moov && mdat && moov.pos < mdat.pos),
+  };
+}
+
+/** Find the first child box of a given type within [base, end).
+ *  `end` matters: without it the scan runs to the end of the whole buffer and
+ *  can pick up a *sibling* box (e.g. reading moov/meta as if it were udta/meta). */
+function findChild(bytes, base, type, end) {
+  const limit = end === undefined ? bytes.length : end;
+  let p = base;
+  while (p + 8 <= limit) {
+    const size = u32(bytes, p);
+    if (size < 8 || p + size > limit) return null;
+    if (fourcc(bytes, p + 4) === type) return { pos: p, size, end: p + size };
+    p += size;
+  }
+  return null;
+}
+
+/**
+ * Walk a box chain and report whether it tiled [base, end) exactly.
+ *
+ * A box whose size is < 8 or runs past `end` — or bytes left over after the
+ * last box — means the structure cannot be fully traversed. Callers that
+ * rewrite a container must treat that as "unparseable" and refuse: silently
+ * stopping at the bad box would drop everything after it while still
+ * reporting a successful write.
+ */
+function listChildrenEx(bytes, base, end) {
+  const children = [];
+  let p = base;
+  let malformed = false;
+  let reason = '';
+  while (p + 8 <= end) {
+    const size = u32(bytes, p);
+    if (size === 1) {
+      // A valid ISO-BMFF largesize box. We do not descend into 64-bit-sized
+      // children, and saying so beats reporting "invalid size".
+      malformed = true; reason = `box ${fourcc(bytes, p + 4)} at ${p} uses a 64-bit largesize header (not supported inside metadata)`;
+      break;
+    }
+    if (size < 8 || p + size > end) {
+      malformed = true; reason = `box ${fourcc(bytes, p + 4)} at ${p} declares size ${size} but only ${end - p} bytes remain`;
+      break;
+    }
+    children.push({ pos: p, size, type: fourcc(bytes, p + 4), end: p + size });
+    p += size;
+  }
+  if (!malformed && p !== end) {
+    malformed = true;
+    reason = `${end - p} trailing byte(s) after the last box at ${p}`;
+  }
+  return { children, malformed, reason };
+}
+
+/** Convenience wrapper for callers that only need the box list. */
+function listChildren(bytes, base, end) {
+  return listChildrenEx(bytes, base, end).children;
+}
+
+/**
+ * Children of a `meta` box, handling both layouts seen in the wild.
+ *
+ * ISO/IEC 14496-12 declares `meta` a FullBox, so its children follow a 4-byte
+ * version/flags field. QuickTime — and Android/MediaTek muxers that follow it —
+ * omit that field, shifting every child 4 bytes earlier. Reading the QuickTime
+ * form with the ISO layout lands in the middle of the first child and yields
+ * garbage sizes.
+ *
+ * Both interpretations are tried; the one that tiles the box exactly *and*
+ * contains the mandatory `hdlr` wins, then whichever merely tiles. Returns
+ * `versionFlags: false` for the bare QuickTime form so the caller can write the
+ * box back the way it found it.
+ */
+function metaChildrenEx(bytes, meta) {
+  const iso = listChildrenEx(bytes, meta.pos + 12, meta.end);
+  const qt = listChildrenEx(bytes, meta.pos + 8, meta.end);
+  const hasHdlr = (r) => !r.malformed && r.children.some((c) => c.type === 'hdlr');
+  if (hasHdlr(iso)) return { children: iso.children, malformed: false, versionFlags: true };
+  if (hasHdlr(qt)) return { children: qt.children, malformed: false, versionFlags: false };
+  if (!iso.malformed) return { children: iso.children, malformed: false, versionFlags: true };
+  if (!qt.malformed) return { children: qt.children, malformed: false, versionFlags: false };
+  return { children: iso.children, malformed: true, versionFlags: true, reason: qt.reason || iso.reason };
+}
+
+/**
+ * Parse every metadata container in moov and merge their ilst entries.
+ *
+ * Two locations carry tag metadata in real files:
+ *   - `moov/udta/meta/ilst` — iTunes / QuickTime (can occur in several udta
+ *     boxes; all of them are merged, which is why mdta indices must be rebased)
+ *   - `moov/meta/ilst`      — ISO/QuickTime movie-level metadata, written by
+ *     Android/MediaTek muxers next to `moov/udta`
+ *
+ * Returns:
+ *   { udtas, containers, ignoredUdtas, hasMetadata, hdlrType, keys, entries,
+ *     extraMetaChildren }                              on success
+ *   { udtas, unparseable: true, reason }               when anything cannot be
+ *                                                      understood completely
+ *
+ * `containers` lists the boxes that actually hold metadata (with their layout
+ * version), so the caller can write the merged result back to the same places.
+ * A udta box *without* a meta child is not a metadata container: it is left
+ * untouched (`ignoredUdtas`) rather than removed — unless it holds QuickTime
+ * `©xxx` tag atoms, which cannot be merged and therefore cause a refusal.
+ */
+function parseExistingIlst(moovBytes) {
+  const moovKids = listChildrenEx(moovBytes, 8, moovBytes.length);
+  if (moovKids.malformed) {
+    return { udtas: [], unparseable: true, reason: 'moov contains a child box with an invalid size' };
+  }
+
+  const udtas = [];        // udta boxes that contain meta (rewritten on write)
+  const containers = [];   // metadata boxes to read from / write back to
+  const ignoredUdtas = []; // udta boxes without meta: preserved, never rewritten
+
+  for (const k of moovKids.children) {
+    if (k.type === 'udta') {
+      const meta = findChild(moovBytes, k.pos + 8, 'meta', k.end);
+      if (meta) {
+        udtas.push(k);
+        containers.push({ meta, label: `udta@${k.pos}/meta`, udta: k });
+        continue;
+      }
+      const kids = listChildrenEx(moovBytes, k.pos + 8, k.end);
+      const qtTags = kids.children.filter((c) => c.type.charCodeAt(0) === 0xa9);
+      if (qtTags.length) {
+        // QuickTime stores tags as ©xxx atoms directly under udta. We do not
+        // merge those yet, and rewriting the udta would drop them.
+        return {
+          udtas, unparseable: true,
+          reason: `udta box at offset ${k.pos} holds QuickTime tag atoms `
+            + `(${qtTags.map((c) => c.type).join(', ')}) that cannot be merged yet`,
+        };
+      }
+      ignoredUdtas.push(k);
+    } else if (k.type === 'meta') {
+      containers.push({ meta: { pos: k.pos, size: k.size, end: k.end }, label: 'moov/meta' });
+    }
+  }
+
+  let hdlrType = 'mdir';
+  let keys = [];
+  const entries = [];
+  // Preserve unknown meta children (neither hdlr, keys, nor ilst)
+  const extraMetaChildren = [];
+  const hdlrTypes = new Set();
+
+  for (const container of containers) {
+    const { meta } = container;
+    const metaKids = metaChildrenEx(moovBytes, meta);
+    container.versionFlags = metaKids.versionFlags;
+    if (metaKids.malformed) {
+      return {
+        udtas, containers, ignoredUdtas, hasMetadata: true, unparseable: true,
+        reason: `meta subtree of ${container.label} is malformed (${metaKids.reason})`,
+      };
+    }
+    const hdlr = metaKids.children.find((k) => k.type === 'hdlr');
+    const localHdlr = hdlr ? fourcc(moovBytes, hdlr.pos + 16) : null;
+    container.hdlrType = localHdlr;
+    if (localHdlr) { hdlrType = localHdlr; hdlrTypes.add(localHdlr); }
+    const keysBox = metaKids.children.find((k) => k.type === 'keys');
+    const localKeys = [];
+    if (keysBox) {
+      const count = u32(moovBytes, keysBox.pos + 12);
+      let kp = keysBox.pos + 16;
+      for (let i = 0; i < count && kp + 8 <= keysBox.end; i++) {
+        const s = u32(moovBytes, kp);
+        if (s < 8 || kp + s > keysBox.end) {
+          return {
+            udtas, containers, ignoredUdtas, hasMetadata: true, unparseable: true,
+            reason: `keys table of ${container.label} is malformed`,
+          };
+        }
+        localKeys.push(new TextDecoder().decode(moovBytes.subarray(kp + 8, kp + s)));   // size(4)+'mdta'(4)+key
+        kp += s;
+      }
+      if (kp !== keysBox.end) {
+        return {
+          udtas, containers, ignoredUdtas, hasMetadata: true, unparseable: true,
+          reason: `keys table of ${container.label} does not tile its box`,
+        };
+      }
+    }
+    container.keys = localKeys;
+    // Merge keys (deduplicated)
+    for (const k of localKeys) if (!keys.includes(k)) keys.push(k);
+
+    const localEntries = [];
+    const ilst = metaKids.children.find((k) => k.type === 'ilst');
+    if (ilst) {
+      const ilstKids = listChildrenEx(moovBytes, ilst.pos + 8, ilst.end);
+      if (ilstKids.malformed) {
+        return {
+          udtas, containers, ignoredUdtas, hasMetadata: true, unparseable: true,
+          reason: `ilst of ${container.label} is malformed (${ilstKids.reason})`,
+        };
+      }
+      for (const c of ilstKids.children) {
+        const name = c.type;
+        const numericIndex = name.charCodeAt(0) === 0 && name.charCodeAt(1) === 0 && name.charCodeAt(2) === 0;
+        let keyValue = null;
+        if (numericIndex) {
+          const idx = u32(moovBytes, c.pos + 4);
+          if (idx < 1 || idx > localKeys.length) {
+            return {
+              udtas, containers, ignoredUdtas, hasMetadata: true, unparseable: true,
+              reason: `ilst entry index ${idx} of ${container.label} does not resolve in its keys table`,
+            };
+          }
+          keyValue = localKeys[idx - 1];
+        }
+        localEntries.push({ name, keyValue, numericIndex, raw: moovBytes.slice(c.pos, c.end) });
+      }
+    }
+    container.entries = localEntries;
+    entries.push(...localEntries);
+
+    // Preserve unknown meta children (per container, so a vendor box stays with
+    // the container it belongs to instead of being copied everywhere)
+    const localExtras = [];
+    for (const k of metaKids.children) {
+      if (k.type !== 'hdlr' && k.type !== 'keys' && k.type !== 'ilst') {
+        localExtras.push(moovBytes.slice(k.pos, k.end));
+      }
+    }
+    container.extraMetaChildren = localExtras;
+    extraMetaChildren.push(...localExtras);
+  }
+
+  // Containers using different handler types (an iTunes mdir udta next to an
+  // Android mdta moov/meta is a real iOS/QuickTime layout). They cannot be
+  // merged into one ilst without corrupting the semantics of one of them, so
+  // the caller is told to update each container in its own format instead.
+  const mixedHandlers = hdlrTypes.size > 1;
+
+  return {
+    udtas, containers, ignoredUdtas,
+    hasMetadata: containers.length > 0,
+    hdlrType, keys, entries, extraMetaChildren,
+    hdlrTypes: [...hdlrTypes], mixedHandlers,
+  };
+}
+
+function readTagValue(raw) {
+  // Extract the UTF-8 payload from the first data box inside an ilst entry
+  let p = 8;
+  while (p + 8 <= raw.length) {
+    const size = u32(raw, p);
+    if (size < 8 || p + size > raw.length) return '';
+    if (fourcc(raw, p + 4) === 'data' && size >= 16) {
+      return new TextDecoder().decode(raw.subarray(p + 16, p + size));
+    }
+    p += size;
+  }
+  return '';
+}
+
+/** Patch stco/co64 offsets: operates only within moov, O(chunk count),
+ *  does not copy media data. */
+function patchChunkOffsets(bytes, moovStart, moovEnd, delta, threshold, report) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let patched = 0, needCo64 = false;
+  const walk = (start, end) => {
+    let p = start;
+    while (p + 8 <= end) {
+      let size = u32(bytes, p), header = 8;
+      if (size === 1) { header = 16; size = u64(bytes, p + 8); } else if (size === 0) size = end - p;
+      if (size < header || p + size > end) return;
+      const type = fourcc(bytes, p + 4);
+      if (type === 'stco') {
+        const count = u32(bytes, p + 12);
+        if (p + 16 + count * 4 > p + size) return;   // declared count exceeds the box
+        for (let i = 0; i < count; i++) {
+          const off = p + 16 + i * 4;
+          if (off + 4 > end) return;
+          const v = dv.getUint32(off);
+          if (v >= threshold) {
+            const nv = v + delta;
+            if (nv < 0 || nv > 0xffffffff) { needCo64 = true; return; }
+            dv.setUint32(off, nv >>> 0);
+            patched++;
+          }
+        }
+      } else if (type === 'co64') {
+        const count = u32(bytes, p + 12);
+        if (p + 16 + count * 8 > p + size) return;   // declared count exceeds the box
+        for (let i = 0; i < count; i++) {
+          const off = p + 16 + i * 8;
+          if (off + 8 > end) return;
+          const v = u64(bytes, off);
+          if (v >= threshold) {
+            const nv = v + delta;
+            if (nv < 0) { needCo64 = true; return; }
+            dv.setBigUint64(off, BigInt(nv));
+            patched++;
+          }
+        }
+      } else if (['trak', 'mdia', 'minf', 'stbl'].includes(type)) {
+        walk(p + header, p + size);
+      }
+      p += size;
+    }
+  };
+  walk(moovStart + 8, moovEnd);
+  report.notes.push(`patched ${patched} stco/co64 entries (threshold 0x${threshold.toString(16)}, delta ${delta})`);
+  if (needCo64) throw fail('CO64_REQUIRED', 'stco entry overflows 32 bits; co64 upgrade path was not taken');
+}
+
+/** Container boxes whose descendants may hold stco/co64 tables. */
+const OFFSET_CONTAINERS = ['moov', 'trak', 'mdia', 'minf', 'stbl'];
+
+/**
+ * Every `stco`/`co64` box must be able to hold the entry count it declares.
+ *
+ * A count that runs past the end of its own box makes the offset walkers read
+ * — and then *patch* — the bytes of whatever box follows, i.e. silently corrupt
+ * unrelated data. Malformed input is refused before any planning happens.
+ *
+ * @returns {string|null} a description of the first inconsistent table
+ */
+function findInconsistentOffsetTable(moovBytes) {
+  let bad = null;
+  walkOffsetBoxes(moovBytes, 0, moovBytes.length, (type, pos, size) => {
+    if (bad) return;
+    const width = type === 'stco' ? 4 : 8;
+    const count = u32(moovBytes, pos + 12);
+    if (16 + count * width > size) {
+      const room = Math.max(0, Math.floor((size - 16) / width));
+      bad = `${type} at offset ${pos} declares ${count} entries but its box (${size} bytes) `
+        + `has room for only ${room}`;
+    }
+  });
+  return bad;
+}
+
+/**
+ * Rewriting moov holds the original moov, the rebuilt moov and the box tables
+ * at the same time. Measured peak ≈ 4.2× moov size (4 MB moov / 1M samples),
+ * i.e. independent of the media size but not free for very long recordings.
+ */
+const MOOV_MEMORY_FACTOR = 4.2;
+/** Warn once the moov alone implies roughly 67 MB of extra memory. */
+const MOOV_WARN_BYTES = 16 << 20;
+/** All container boxes that must have their size recalculated on rewrite. */
+const REWRITE_CONTAINERS = ['moov', 'trak', 'mdia', 'minf', 'stbl'];
+
+/** Walk every stco/co64 box inside [start, end) and call fn(type, pos, size). */
+function walkOffsetBoxes(bytes, start, end, fn) {
+  let p = start;
+  while (p + 8 <= end) {
+    let size = u32(bytes, p);
+    let header = 8;
+    if (size === 1) { header = 16; size = u64(bytes, p + 8); }
+    else if (size === 0) size = end - p;
+    if (size < header || p + size > end) return;
+    const type = fourcc(bytes, p + 4);
+    if (type === 'stco' || type === 'co64') fn(type, p, size);
+    else if (OFFSET_CONTAINERS.includes(type)) walkOffsetBoxes(bytes, p + header, p + size, fn);
+    p += size;
+  }
+}
+
+/**
+ * Determine how many extra bytes are required if some stco boxes must be
+ * upgraded to co64.
+ *
+ * Upgrading stco -> co64 adds 4 bytes per entry (32-bit -> 64-bit offsets),
+ * which enlarges moov, which increases the shift delta, which may push further
+ * entries past 2^32-1 and require even more upgrades. This is a fixed-point
+ * problem. Because delta grows monotonically with growth, iterating from
+ * growth = 0 converges (each pass can only mark more boxes, never fewer).
+ */
+function planStcoUpgrade(moovBytes, baseDelta, threshold) {
+  let growth = 0;
+  for (let iter = 0; iter < 64; iter++) {
+    const delta = baseDelta + growth;
+    let needed = 0;
+    walkOffsetBoxes(moovBytes, 0, moovBytes.length, (type, pos) => {
+      if (type !== 'stco') return;
+      const count = u32(moovBytes, pos + 12);
+      for (let i = 0; i < count; i++) {
+        const v = u32(moovBytes, pos + 16 + i * 4);
+        if (v >= threshold && v + delta > 0xffffffff) { needed += count * 4; break; }
+      }
+    });
+    if (needed === growth) return growth;      // fixed point reached
+    growth = needed;
+  }
+  // Each pass can only mark *more* boxes for upgrade, so `growth` is monotone
+  // and reaches a fixed point within (number of stco boxes + 1) steps. Running
+  // out of iterations means the moov has more offset tables than the guard
+  // allows; using a stale `growth` would shift every offset by the wrong delta,
+  // so refuse instead of writing a file whose sample offsets are off.
+  throw fail('CONVERGENCE',
+    'stco -> co64 upgrade planning did not converge; refusing to rewrite offsets');
+}
+
+/**
+ * Rewrite moov: shift every stco/co64 offset by delta (only entries pointing
+ * past `threshold`), upgrading any overflowing stco box to co64. Returns fresh
+ * moov bytes with all container sizes recalculated.
+ */
+function rewriteMoov(moovBytes, delta, threshold, report) {
+  let upgraded = 0, patched = 0;
+
+  const process = (start, end) => {
+    const parts = [];
+    let p = start;
+    while (p + 8 <= end) {
+      let size = u32(moovBytes, p);
+      let header = 8;
+      if (size === 1) { header = 16; size = u64(moovBytes, p + 8); }
+      else if (size === 0) size = end - p;
+      if (size < header || p + size > end) break;
+      const type = fourcc(moovBytes, p + 4);
+
+      if (type === 'stco') {
+        const count = u32(moovBytes, p + 12);
+        if (p + 16 + count * 4 > p + size) break;   // declared count exceeds the box
+        const vals = new Array(count);
+        let needs = false;
+        for (let i = 0; i < count; i++) {
+          const v = u32(moovBytes, p + 16 + i * 4);
+          vals[i] = v;
+          if (v >= threshold && v + delta > 0xffffffff) needs = true;
+        }
+        if (needs) {
+          const body = new Uint8Array(4 + count * 8);
+          const dv = new DataView(body.buffer);
+          dv.setUint32(0, count);
+          for (let i = 0; i < count; i++) {
+            const v = vals[i] >= threshold ? vals[i] + delta : vals[i];
+            dv.setBigUint64(4 + i * 8, BigInt(v));
+            patched++;
+          }
+          parts.push(mp4FullBox('co64', 0, 0, body));
+          upgraded++;
+        } else {
+          const body = new Uint8Array(4 + count * 4);
+          const dv = new DataView(body.buffer);
+          dv.setUint32(0, count);
+          for (let i = 0; i < count; i++) {
+            const v = vals[i] >= threshold ? vals[i] + delta : vals[i];
+            dv.setUint32(4 + i * 4, v >>> 0);
+            patched++;
+          }
+          parts.push(mp4FullBox('stco', 0, 0, body));
+        }
+      } else if (type === 'co64') {
+        const count = u32(moovBytes, p + 12);
+        if (p + 16 + count * 8 > p + size) break;   // declared count exceeds the box
+        const body = new Uint8Array(4 + count * 8);
+        const dv = new DataView(body.buffer);
+        dv.setUint32(0, count);
+        for (let i = 0; i < count; i++) {
+          let v = u64(moovBytes, p + 16 + i * 8);
+          if (v >= threshold) v += delta;
+          dv.setBigUint64(4 + i * 8, BigInt(v));
+          patched++;
+        }
+        parts.push(mp4FullBox('co64', 0, 0, body));
+      } else if (REWRITE_CONTAINERS.includes(type)) {
+        const childBytes = process(p + header, p + size);
+        const newSize = header + childBytes.length;
+        const out = new Uint8Array(newSize);
+        const dv = new DataView(out.buffer);
+        if (header === 16) {
+          dv.setUint32(0, 1);
+          for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+          dv.setBigUint64(8, BigInt(newSize));
+        } else {
+          dv.setUint32(0, newSize);
+          for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+        }
+        out.set(childBytes, header);
+        parts.push(out);
+      } else {
+        parts.push(moovBytes.subarray(p, p + size));
+      }
+      p += size;
+    }
+    return cat(parts);
+  };
+
+  const bytes = process(0, moovBytes.length);
+  report.notes.push(`rewrote moov: ${patched} offsets shifted, ${upgraded} stco box(es) upgraded to co64`);
+  return { bytes, upgraded, patched };
+}
+
+export async function planMp4(src, tags, report, opts = {}, seed) {
+  const probe = await probeMp4(src, seed);
+  report.probe = {
+    fastStart: probe.fastStart,
+    moovAt: probe.moov ? probe.moov.pos : -1,
+    moovSize: probe.moov ? probe.moov.size : 0,
+    boxCount: probe.boxes.length,
+    fragmented: probe.hasFragments,
+    boxList: probe.boxes.map((b) => b.type).join(','),
+  };
+  report.probe.metadataContainers = [];
+  if (!probe.moov) {
+    // Distinguish "not an MP4 at all" from "an ISOBMFF still image" — the latter
+    // is a common first-contact case (AVIF/HEIC) and deserves a real answer.
+    const brand = seed && seed.length >= 12
+      ? String.fromCharCode(seed[8], seed[9], seed[10], seed[11]) : '';
+    const kind = ISOBMFF_IMAGE_BRANDS[brand.trim()];
+    throw fail('UNSUPPORTED_FORMAT', kind
+      ? `${kind} (ftyp brand "${brand}") is not supported: it carries metadata in meta/iloc, not moov/udta. Supported: JPEG, PNG, MP4/MOV`
+      : 'moov box not found (not a recognizable MP4/MOV)');
+  }
+  report.notes.push(probe.fastStart ? 'faststart: moov precedes mdat' : 'moov is after media data (tail)');
+  if (probe.moov.size > MOOV_WARN_BYTES) {
+    report.warnings.push(`moov is ${(probe.moov.size / 1048576).toFixed(1)} MB; rewriting it peaks at roughly `
+      + `${(probe.moov.size * MOOV_MEMORY_FACTOR / 1048576).toFixed(0)} MB of extra memory `
+      + `(≈${MOOV_MEMORY_FACTOR}× moov, independent of the media size). `
+      + 'Check inspect().mp4.moovSize before writing very long recordings.');
+  }
+
+  const moov = await src._read(probe.moov.pos, probe.moov.end);
+  if (moov.length !== probe.moov.size) throw fail('MALFORMED_CONTAINER', 'moov read incomplete');
+
+  // Validate metadataFormat option (#6)
+  const userFormat = opts.metadataFormat || 'auto';
+  if (!['auto', 'mdir', 'mdta'].includes(userFormat)) {
+    throw fail('BAD_OPTION', `metadataFormat must be 'auto' | 'mdir' | 'mdta', received: ${userFormat}`);
+  }
+
+  // A moov whose own header is a 64-bit largesize cannot be rewritten yet.
+  // Checked before parsing so the caller gets the real reason instead of a
+  // puzzling "child box with an invalid size".
+  if (u32(moov, 0) === 1) {
+    throw fail('UNSUPPORTED_LARGESIZE',
+      'REFUSE: moov uses a 64-bit largesize header; rewriting it is not supported yet');
+  }
+
+  // A file with more than one moov is malformed; rewriting the first would
+  // leave the others pointing at the old layout.
+  const moovCount = probe.boxes.filter((b) => b.type === 'moov').length;
+  if (moovCount > 1) {
+    throw fail('MALFORMED_CONTAINER',
+      `REFUSE: file contains ${moovCount} moov boxes; only one is meaningful and `
+      + 'rewriting it would invalidate the others');
+  }
+
+  // Guard the offset tables before anything reads or patches them.
+  const badTable = findInconsistentOffsetTable(moov);
+  if (badTable) {
+    throw fail('MALFORMED_CONTAINER',
+      `REFUSE: ${badTable}; patching it would write into the neighbouring box`);
+  }
+
+  const existing = parseExistingIlst(moov);
+
+  // Refuse to write when the existing metadata tree cannot be fully parsed:
+  // merging a partially understood container would silently drop the boxes we
+  // could not reach. This is a hard stop, not a warning.
+  if (existing.unparseable) {
+    throw fail('MALFORMED_CONTAINER',
+      `REFUSE: ${existing.reason}; refusing to write to avoid silently dropping metadata`);
+  }
+
+  const hasMetadata = existing.hasMetadata;
+  report.probe.metadataContainers = existing.containers.map((c) => c.label);
+  const metaFormat = userFormat === 'auto'
+    ? (hasMetadata && existing.hdlrType === 'mdta' ? 'mdta' : (hasMetadata ? existing.hdlrType : 'mdir'))
+    : userFormat;
+
+  // Containers that disagree on the handler type (iTunes mdir udta next to an
+  // Android mdta moov/meta) cannot share one ilst: numeric indices and ©-atoms
+  // mean different things under each handler. 'auto' therefore updates each
+  // container in place, in its own format, instead of merging them.
+  const splitContainers = hasMetadata && existing.mixedHandlers && userFormat === 'auto';
+
+  const ops = [];
+  let preservedTotal = 0;
+  if (splitContainers) {
+    for (const c of existing.containers) {
+      const format = c.hdlrType || 'mdir';
+      const built = buildMetaBox(c, tags, format);
+      preservedTotal += built.preserved;
+      if (c.udta) {
+        ops.push({ start: c.udta.pos, end: c.udta.end, bytes: replaceUdtaMeta(moov, c.udta, built.bytes) });
+      } else {
+        ops.push({ start: c.meta.pos, end: c.meta.end, bytes: built.bytes });
+      }
+    }
+    report.notes.push(`mixed metadata handlers (${existing.hdlrTypes.join(' + ')}): `
+      + `updated ${existing.containers.length} container(s) in place, each in its own format`);
+  } else {
+    // One format across all containers: merge them into a single output.
+    const merged = buildMetaBox(hasMetadata ? existing : null, tags, metaFormat);
+    preservedTotal = merged.preserved;
+    const metaIso = merged.bytes;
+
+    if (existing.udtas.length) {
+      if (existing.udtas.length > 1) {
+        report.warnings.push(`moov has ${existing.udtas.length} udta meta containers (legacy); merged into 1`);
+      }
+      for (const c of existing.udtas) ops.push({ start: c.pos, end: c.end, bytes: null });
+      ops.push({ start: moov.length, end: moov.length, bytes: wrapUdta(metaIso) });
+    }
+    for (const c of existing.containers) {
+      if (c.label === 'moov/meta') {
+        const own = c.versionFlags === false ? buildMetaBox(c, tags, metaFormat).bytes : metaIso;
+        ops.push({ start: c.meta.pos, end: c.meta.end, bytes: own });
+      }
+    }
+    if (!ops.length) ops.push({ start: moov.length, end: moov.length, bytes: wrapUdta(metaIso) });
+  }
+
+  if (hasMetadata) {
+    report.notes.push(`merged existing metadata (` +
+      `${existing.containers.map((c) => c.label).join(' + ')}, hdlr=${existing.hdlrTypes.join('+') || existing.hdlrType}, ` +
+      `${existing.entries.length} old entries, preserved ${preservedTotal})`);
+  } else {
+    report.notes.push('no existing metadata; created moov/udta/meta/ilst');
+  }
+  if (existing.ignoredUdtas.length) {
+    report.notes.push(`left ${existing.ignoredUdtas.length} udta box(es) without a meta box untouched`);
+  }
+
+  ops.sort((a, b) => a.start - b.start);
+  let newMoovLen = moov.length;
+  for (const op of ops) newMoovLen += (op.bytes ? op.bytes.length : 0) - (op.end - op.start);
+  const outMoov = new Uint8Array(newMoovLen);
+  {
+    let r = 0, w = 0;
+    for (const op of ops) {
+      if (op.start < r) throw new Error('overlapping moov rewrite regions');
+      outMoov.set(moov.subarray(r, op.start), w); w += op.start - r;
+      if (op.bytes) { outMoov.set(op.bytes, w); w += op.bytes.length; }
+      r = op.end;
+    }
+    outMoov.set(moov.subarray(r, moov.length), w); w += moov.length - r;
+  }
+  new DataView(outMoov.buffer).setUint32(0, outMoov.length);       // sync moov size
+  const delta = outMoov.length - moov.length;
+
+  if (delta === 0) {
+    // Byte-by-byte confirmation: only treat as no-op if truly identical
+    let identical = true;
+    for (let i = 0; i < outMoov.length; i++) if (outMoov[i] !== moov[i]) { identical = false; break; }
+    if (identical) {
+      report.notes.push('target tags are byte-identical to existing; no modification needed (idempotent no-op)');
+      return { format: 'mp4', edits: [], metaFormat, delta: 0, noop: true, bytesReadFor: probe.moov.size,
+        preservedTags: preservedTotal, offsets: { stcoUpgraded: false, moovDelta: 0 } };
+    }
+  }
+
+  if (probe.hasFragments && !opts.allowUnsafeFragmented) {
+    throw fail('FRAGMENTED_MP4',
+      'REFUSE: this is a fragmented MP4 (moof/sidx present); sample offsets are ' +
+      'scattered across trun/tfhd/saio/sidx. Inserting before media data would ' +
+      'invalidate all of them. Writing refused (consider re-muxing or keeping the original file).'
+    );
+  }
+
+  // Determine whether any stco box must be upgraded to co64 (fixed-point
+  // iteration, since the upgrade itself enlarges moov and shifts offsets).
+  const growth = planStcoUpgrade(outMoov, delta, probe.moov.end);
+  const finalDelta = delta + growth;
+
+  let finalMoov;
+  if (growth === 0) {
+    // No upgrade needed: shift offsets in place.
+    patchChunkOffsets(outMoov, 0, outMoov.length, finalDelta, probe.moov.end, report);
+    finalMoov = outMoov;
+  } else {
+    // Overflow: rebuild moov with stco -> co64 upgrades and shifted offsets.
+    finalMoov = rewriteMoov(outMoov, finalDelta, probe.moov.end, report).bytes;
+    report.notes.push(`stco -> co64 upgrade: +${growth} bytes (moov ${moov.length} -> ${finalMoov.length})`);
+  }
+
+  const edits = [{ start: probe.moov.pos, end: probe.moov.end, bytes: finalMoov, what: `replace moov (metadata rewritten, size ${moov.length} -> ${finalMoov.length})` }];
+  return {
+    format: 'mp4', edits, metaFormat, delta: finalDelta, bytesReadFor: probe.moov.size,
+    preservedTags: preservedTotal,
+    offsets: { stcoUpgraded: growth > 0, moovDelta: finalDelta },
+  };
+}
+
+/* ===========================================================================
+ * 7. Assembly: convert edits into reference slices, then into a Blob or
+ *    ReadableStream.
+ * ========================================================================= */
+
+function buildParts(src, edits) {
+  // At the same start position a zero-length insertion must be emitted *before*
+  // a removal/replacement that begins there — "insert at P" means "before
+  // whatever currently occupies P" (this is how a new EXIF APP1 can take the
+  // slot of the XMP segment being deleted at the very same offset).
+  const sorted = edits.slice().sort((a, b) =>
+    (a.start - b.start) || ((a.end - a.start) - (b.end - b.start)));
+  const parts = [];
+  let cur = 0;
+  for (const e of sorted) {
+    if (e.start < cur) throw new Error('edit ranges overlap');
+    if (e.start > cur) parts.push({ kind: 'ref', start: cur, end: e.start });
+    if (e.bytes && e.bytes.length) parts.push({ kind: 'bytes', bytes: e.bytes, what: e.what });
+    cur = e.end;
+  }
+  if (cur < src.size) parts.push({ kind: 'ref', start: cur, end: src.size });
+  const size = parts.reduce((a, p) => a + (p.kind === 'bytes' ? p.bytes.length : p.end - p.start), 0);
+  return { parts, size };
+}
+
+/** Blob / memory source -> Blob. In runtimes that implement Blob
+ *  composition by reference (browsers, Node), the media payload is not
+ *  copied into the JS heap during assembly. */
+function partsToBlob(src, parts, type) {
+  const chunks = parts.map((p) => (p.kind === 'bytes' ? p.bytes : src._slice(p.start, p.end)));
+  return new Blob(chunks, { type: type || src.type || 'application/octet-stream' });
+}
+
+/** Any source -> ReadableStream: can be piped directly to a
+ *  showSaveFilePicker WritableStream for a network-to-disk pipeline
+ *  with minimal heap usage. */
+export function partsToStream(src, parts, chunkSize = 4 << 20) {
+  if (!Number.isInteger(chunkSize) || chunkSize <= 0)
+    throw new RangeError('chunkSize must be a positive integer');
+  let i = 0, offsetInRef = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      while (i < parts.length) {
+        const p = parts[i];
+        if (p.kind === 'bytes') {
+          i++;
+          if (p.bytes.length) { controller.enqueue(p.bytes); return; }
+          continue;
+        }
+        const from = p.start + offsetInRef;
+        const to = Math.min(p.end, from + chunkSize);
+        if (from >= p.end) { i++; offsetInRef = 0; continue; }
+        const buf = await src.read(from, to);
+        offsetInRef = to - p.start;
+        controller.enqueue(buf);
+        return;
+      }
+      controller.close();
+    },
+  });
+}
+
+/* ===========================================================================
+ * 8. Public API
+ * ========================================================================= */
+
+/** Probe: writes nothing. Returns format, safety assessment, and estimated
+ *  byte change. */
+export async function inspect(source) {
+  const src = await normalizeSource(source);
+  const head = await readHeadAt(src, 16, null);
+  const format = sniff(head, src.type);
+  const info = { format, size: src.size, mime: src.type || '', capabilities: capabilities(format) };
+  if (format === 'jpeg') {
+    try {
+      const j = await scanJpeg(src, { notes: [] }, head);
+      let mpf = null;
+      if (j.mpf && j.mpf.length) {
+        const m = j.mpf[0];
+        const parsed = parseMpf(j.head.subarray(m.start, m.end), m.start, src.size);
+        mpf = {
+          images: parsed.entries.length,
+          lengths: parsed.entries.map((e) => e.size),
+          offsets: parsed.entries.map((e) => e.startAbs),
+          offsetBase: parsed.baseKind,
+        };
+      }
+      info.jpeg = {
+        existingXmp: j.removes.length > 0,
+        insertionPoint: j.insertAt,
+        // stale Extended XMP fragments are dropped on write
+        extendedXmpFragments: j.extRemoves.length,
+        // non-null => motion photo / MPO: secondary payload indexed by absolute offsets
+        multiPicture: mpf,
+      };
+    } catch (e) { info.jpeg = { error: String((e && e.message) || e) }; }
+  }
+  if (format === 'mp4') {
+    try {
+      const probe = await probeMp4(src, head);
+      const moov = probe.moov ? await src._read(probe.moov.pos, probe.moov.end) : null;
+      const stsd = moov ? findStsd(moov) : null;
+      // A metadata tree that cannot be fully parsed will make writeTags() refuse
+      // (see parseExistingIlst); surface that here so a caller can pre-check
+      // instead of discovering it when the write fails.
+      const existing = moov ? parseExistingIlst(moov) : null;
+      const metadataMalformed = !!(existing && existing.unparseable);
+      info.mp4 = {
+        fastStart: probe.fastStart,
+        fragmented: probe.hasFragments,
+        moovAt: probe.moov ? probe.moov.pos : -1,
+        moovSize: probe.moov ? probe.moov.size : 0,
+        safeToWrite: !probe.hasFragments && !metadataMalformed,
+        ...(metadataMalformed ? { metadataMalformed: existing.reason } : {}),
+        ...(existing && existing.hasMetadata ? {
+          metadataFormat: existing.mixedHandlers ? 'mixed' : (existing.hdlrType || 'mdir'),
+          metadataContainers: existing.containers.map((c) => c.label),
+        } : {}),
+        codec: stsd ? stsd.codec : null,
+        video: stsd ? stsd.video : null,
+        durationSec: stsd ? stsd.durationSec : null,
+        bitrate: stsd ? stsd.bitrate : null,
+        existingTags: moov ? summarizeIlst(moov) : null,
+      };
+    } catch (e) { info.mp4 = { error: String(e.message || e) }; }
+  }
+  info.readStats = { ...src.stats };
+  return info;
+}
+
+function summarizeIlst(moov) {
+  const ex = parseExistingIlst(moov);
+  if (!ex || ex.unparseable || !ex.hasMetadata) return null;
+  const out = {};
+  for (const e of ex.entries) {
+    const key = e.keyValue || e.name.replace(/\xa9/, '©');
+    out[key] = readTagValue(e.raw).slice(0, 80);
+  }
+  return out;
+}
+
+/** Read stsd from moov: codec, resolution, duration, bitrate. */
+function findStsd(moov) {
+  const traks = listChildren(moov, 8, moov.length).filter((b) => b.type === 'trak');
+  let result = null;
+  for (const trak of traks) {
+    const mdia = findChild(moov, trak.pos + 8, 'mdia', trak.end);
+    if (!mdia) continue;
+    const mdhd = findChild(moov, mdia.pos + 8, 'mdhd', mdia.end);
+    const hdlr = findChild(moov, mdia.pos + 8, 'hdlr', mdia.end);
+    const handler = hdlr ? fourcc(moov, hdlr.pos + 16) : '';
+    const minf = findChild(moov, mdia.pos + 8, 'minf', mdia.end);
+    if (!minf) continue;
+    const stbl = findChild(moov, minf.pos + 8, 'stbl', minf.end);
+    if (!stbl) continue;
+    const stsd = findChild(moov, stbl.pos + 8, 'stsd', stbl.end);
+    const stsz = findChild(moov, stbl.pos + 8, 'stsz', stbl.end);
+    let durationSec = null;
+    if (mdhd) {
+      const ver = moov[mdhd.pos + 8];
+      const ts = ver === 1 ? u32(moov, mdhd.pos + 28) : u32(moov, mdhd.pos + 20);
+      const dur = ver === 1 ? u64(moov, mdhd.pos + 32) : u32(moov, mdhd.pos + 24);
+      if (ts) durationSec = dur / ts;
+    }
+    let mediaBytes = 0;
+    if (stsz) {
+      const sampleSize = u32(moov, stsz.pos + 12);
+      const count = u32(moov, stsz.pos + 16);
+      mediaBytes = sampleSize ? sampleSize * count : (() => {
+        let s = 0;
+        for (let i = 0; i < count && stsz.pos + 20 + i * 4 + 4 <= stsz.end; i++) s += u32(moov, stsz.pos + 20 + i * 4);
+        return s;
+      })();
+    }
+    let codec = null, video = null;
+    if (stsd && u32(moov, stsd.pos + 12) > 0) {
+      const entry = stsd.pos + 16;
+      codec = fourcc(moov, entry + 4);
+      if (handler === 'vide') {
+        video = { width: u16(moov, entry + 32), height: u16(moov, entry + 34) };
+      }
+    }
+    const info = {
+      handler, codec, video, durationSec,
+      mediaBytes,
+      bitrate: durationSec ? Math.round((mediaBytes * 8) / durationSec) : null,
+    };
+    if (handler === 'vide') return info;
+    if (!result) result = info;
+  }
+  return result;
+}
+
+/**
+ * Main entry: writes tags into a media file.
+ * @returns {Promise<{ok:boolean, blob?:Blob, stream?:ReadableStream, parts?:Array, report:Object, error?:string}>}
+ */
+export async function writeTags(source, tags, opts = {}) {
+  const report = { format: null, strategy: null, notes: [], warnings: [], stats: null };
+  const src = await normalizeSource(source);
+  try {
+    // 16 bytes are enough to identify the container; these bytes are passed
+    // as a seed to downstream planners to avoid re-reading.
+    const head = await readHeadAt(src, 16, null);
+    const format = sniff(head, src.type);
+    report.format = format;
+    if (!hasWritableTags(tags)) {
+      throw fail('NO_TAGS', 'no writable tags supplied: pass at least one non-empty field '
+        + '(title, artist, date, comment, url, software, copyright, keywords)');
+    }
+    // Refuse fields this container cannot store instead of reporting ok:true and
+    // dropping them (a caller asking for `keywords` on an MP4 used to get a
+    // silent no-op).
+    const caps = capabilities(format);
+    const unsupported = requestedFields(tags).filter((k) => !caps.supported.includes(k));
+    if (unsupported.length) {
+      report.unsupportedTags = unsupported;
+      report.supportedTags = caps.supported;
+      throw fail('UNSUPPORTED_TAG',
+        `${unsupported.join(', ')} cannot be stored in ${format.toUpperCase()}; `
+        + `this container supports: ${caps.supported.join(', ')}`);
+    }
+    let plan;
+    if (format === 'jpeg') plan = await planJpeg(src, tags, report, head, opts);
+    else if (format === 'png') plan = await planPng(src, tags, report, head, opts);
+    else if (format === 'mp4') plan = await planMp4(src, tags, report, opts, head);
+    else {
+      const hint = FORMAT_HINTS[format];
+      throw fail('UNSUPPORTED_FORMAT', `unsupported format: ${format}`
+        + (hint ? ` — ${hint}` : '')
+        + '; supported: JPEG, PNG, MP4/MOV');
+    }
+
+    report.strategy = plan.format === 'mp4'
+      ? (report.probe.fastStart ? 'moov-at-head-shift-offsets' : 'moov-at-tail-zero-offset')
+      : 'header-in-place-insert';
+    const { parts, size } = buildParts(src, plan.edits);
+    report.outputSize = size;
+    report.edits = plan.edits.map((e) => ({ start: e.start, end: e.end, bytes: e.bytes.length, what: e.what }));
+    if (plan.metaFormat !== undefined) report.metaFormat = plan.metaFormat;
+    if (plan.delta !== undefined) report.delta = plan.delta;
+
+    // ---- Structured summary (additive; notes/warnings/stats keep working) ----
+    const inserted = plan.edits.reduce((a, e) => a + (e.bytes ? e.bytes.length : 0), 0);
+    const removedBytes = plan.edits.reduce((a, e) => a + (e.end - e.start), 0);
+    report.input = { size: src.size, mime: src.type || '' };
+    report.changes = {
+      metadataBytes: inserted,
+      bytesRemoved: removedBytes,
+      netDelta: size - src.size,
+      mediaBytesChanged: false,     // by construction: payloads are reference slices
+      reencoded: false,
+    };
+    report.metadata = {
+      format: plan.metaFormat || (plan.format === 'mp4' ? 'moov/udta/meta' : 'xmp'),
+      addedTags: requestedFields(tags).filter((k) => caps.supported.includes(k)),
+      ...(plan.preservedTags !== undefined ? { preservedTags: plan.preservedTags } : {}),
+      ...(report.probe && report.probe.metadataContainers
+        ? { existingContainers: report.probe.metadataContainers } : {}),
+    };
+    report.offsets = { shifted: size !== src.size, delta: size - src.size, ...(plan.offsets || {}) };
+
+    if (opts.materialize === false) {
+      report.stats = { ...src.stats };
+      return { ok: true, parts, size, report };
+    }
+
+    const out = { ok: true, parts, size, report };
+    if (src.canSlice() && typeof Blob === 'function') {
+      out.blob = partsToBlob(src, parts, opts.mimeType);
+      // Capture stats after Blob assembly so sliceCalls are included (#9)
+      report.stats = { ...src.stats };
+      report.notes.push(`output as Blob: ${parts.length} slices assembled by reference`);
+    } else {
+      out.stream = partsToStream(src, parts, opts.chunkSize);
+      report.stats = { ...src.stats };
+      report.notes.push('output as ReadableStream (source does not support local slicing; pipe to file system writer)');
+    }
+    return out;
+  } catch (e) {
+    report.error = String((e && e.message) || e);
+    if (e && e.code) report.errorCode = e.code;
+    report.stats = { ...src.stats };
+    return { ok: false, report };
+  }
+}
+
+async function normalizeSource(source) {
+  if (source instanceof Source) return source;
+  if (source instanceof Uint8Array || source instanceof ArrayBuffer) return new BufferSource(source);
+  if (typeof Blob === 'function' && source instanceof Blob) return new BlobSource(source);
+  if (typeof source === 'string') return new HttpSource(source).init();
+  if (source && typeof source.read === 'function' && typeof source.size === 'number') return source;
+  throw new TypeError('unrecognized data source');
+}
+
+export default { writeTags, inspect, capabilities, TAG_FIELDS, planJpeg, planPng, planMp4, probeMp4, parseMpf, rebaseMpf, Source, BlobSource, BufferSource, HttpSource, partsToStream, buildXmpPacket };
