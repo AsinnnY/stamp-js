@@ -1,7 +1,7 @@
 {
   "name": "@asinnn/stamp-js",
   "version": "0.1.0",
-  "description": "Low-memory media metadata writer: writes XMP / iTunes tags into JPEG, PNG, and MP4/MOV without re-muxing or re-encoding.",
+  "description": "Zero-dependency JPEG/PNG/MP4/MOV metadata writer: XMP, native EXIF (IFD0/eXIf), iTunes tags and MPF rebasing. Reads only the container header, so a 4 GiB video is tagged after 66 KB — no re-mux, no re-encode, the media payload never enters the heap.",
   "type": "module",
   "main": "./src/stamp.js",
   "module": "./src/stamp.js",
