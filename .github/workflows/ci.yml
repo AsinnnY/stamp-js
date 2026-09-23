@@ -94,13 +94,14 @@ jobs:
       - name: Independent verification suite
         run: python3 test/independent-verify.py
 
-      - name: Confirm the verification suites did not silently skip
+      # The suites exit 2 (not 0) when a tool is missing, so a green run already
+      # implies the tools were there — this asserts that explicitly and cheaply,
+      # without re-running the whole suite.
+      - name: Verify the third-party tools are actually present
         run: |
-          set -o pipefail
-          python3 test/independent-verify.py | tail -3
-          # exit code 2 means "dependency missing"; the suite must not be green by default
-          python3 test/independent-verify.py > /dev/null
-          echo "independent verification ran with all dependencies present"
+          exiftool -ver
+          python3 -c "import PIL, requests; print('Pillow', PIL.__version__)"
+          node --version
 
   # ------------------------------- Tier 3 -------------------------------
   # Runs on release tags / manual dispatch only: it needs real device material

@@ -981,8 +981,16 @@ try:
               b.get('IFD0:Software') == 'FW 01.0', repr(b.get('IFD0:Software')))
         check('M 夹具：XMP 侧仍完整（comment/url/keywords 走 XMP）',
               b.get('XMP-dc:Description') is not None and b.get('XMP-dc:Creator') == NATIVE['artist'])
-        v = subprocess.run(['exiftool', '-s', '-validate', out_exif], capture_output=True, text=True).stdout
-        check('M 夹具：exiftool -validate 仍为 OK', 'Validate' in v and 'OK' in v, v.strip()[:80])
+        # Compare against the input instead of demanding "OK": the fixture carries a
+        # placeholder thumbnail, and exiftool versions differ in what they warn
+        # about, so what matters is that *our write* adds no new warning.
+        def validate_warnings(path):
+            out = subprocess.run(['exiftool', '-s', '-validate', path], capture_output=True, text=True).stdout
+            return out.count('Warning'), out.strip().replace('\n', ' | ')[:140]
+        w_in, t_in = validate_warnings(FIXTURE)
+        w_out, t_out = validate_warnings(out_exif)
+        check('M 夹具：写入未引入新的 exiftool 告警', w_out <= w_in,
+              'in=%d out=%d\n      %s\n      %s' % (w_in, w_out, t_in, t_out))
 
     # (b) PNG eXIf + UserComment（第三方确认）
     PNG_FIX = os.path.join(WORK, 'm_exif_src.png')
