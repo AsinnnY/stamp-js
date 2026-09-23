@@ -11,7 +11,7 @@ These cannot be derived from the code — fill them in before the first publish:
 | Field | Needed for | Example |
 |---|---|---|
 | GitHub repository | `package.json` `repository` / `bugs` / `homepage`, README badge | `AsinnnY/stamp-js` |
-| npm package name | `package.json` `name` | `stamp-js` — checked against the registry and still free at the time of writing |
+| npm package name | `package.json` `name` | `@asinnn/stamp-js` — the unscoped `stamp-js` is refused by npm as too similar to the existing `stampjs` |
 | Author name + email | `package.json` `author`, `LICENSE` copyright line | `Asinnny <…@…>` |
 | Whether `README.zh-CN.md` / `VERIFICATION.md` / `test/` ship in the tarball | `package.json` `files` | currently: docs + `src` + `dist` only |
 | Release notes source | GitHub release body | the `[Unreleased]` section of `CHANGELOG.md` |

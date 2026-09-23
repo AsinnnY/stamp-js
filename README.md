@@ -1,7 +1,7 @@
 # stamp-js
 
 [![CI](https://github.com/AsinnnY/stamp-js/actions/workflows/ci.yml/badge.svg)](https://github.com/AsinnnY/stamp-js/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/stamp-js.svg)](https://www.npmjs.com/package/stamp-js)
+[![npm](https://img.shields.io/npm/v/@asinnn/stamp-js.svg)](https://www.npmjs.com/package/@asinnn/stamp-js)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Write metadata (XMP / iTunes tags) into JPEG, PNG, MP4 and MOV **without reading
@@ -60,11 +60,11 @@ Measured on Node 22 with sparse files and real `Blob`s (`npm test`).
 ## Install
 
 ```bash
-npm install stamp-js
+npm install @asinnn/stamp-js
 ```
 
 ```js
-import { writeTags, BlobSource } from 'stamp-js';
+import { writeTags, BlobSource } from '@asinnn/stamp-js';
 
 const res = await writeTags(new BlobSource(file), {
   title: 'Title', artist: 'Artist', date: '2026-04-02T09:30:00Z',
@@ -88,8 +88,8 @@ source instead:
 import fs from 'node:fs';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { writeTags } from 'stamp-js';
-import { NodeFileSource } from 'stamp-js/node';
+import { writeTags } from '@asinnn/stamp-js';
+import { NodeFileSource } from '@asinnn/stamp-js/node';
 
 const src = new NodeFileSource('huge.mp4');          // true 64-bit size via fstat
 const res = await writeTags(src, { title: 'Big file' });

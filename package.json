@@ -1,5 +1,5 @@
 {
-  "name": "stamp-js",
+  "name": "@asinnn/stamp-js",
   "version": "0.1.0",
   "description": "Low-memory media metadata writer: writes XMP / iTunes tags into JPEG, PNG, and MP4/MOV without re-muxing or re-encoding.",
   "type": "module",
@@ -59,6 +59,9 @@
     "url": "https://github.com/AsinnnY/stamp-js/issues"
   },
   "homepage": "https://github.com/AsinnnY/stamp-js#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=18"
   },

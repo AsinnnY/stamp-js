@@ -1,7 +1,7 @@
 # stamp-js
 
 [![CI](https://github.com/AsinnnY/stamp-js/actions/workflows/ci.yml/badge.svg)](https://github.com/AsinnnY/stamp-js/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/stamp-js.svg)](https://www.npmjs.com/package/stamp-js)
+[![npm](https://img.shields.io/npm/v/@asinnn/stamp-js.svg)](https://www.npmjs.com/package/@asinnn/stamp-js)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 向 JPEG、PNG、MP4、MOV 写入元数据（XMP / iTunes 标签），**不把媒体数据读入内存**。
@@ -48,11 +48,11 @@
 ## 安装
 
 ```bash
-npm install stamp-js
+npm install @asinnn/stamp-js
 ```
 
 ```js
-import { writeTags, BlobSource } from 'stamp-js';
+import { writeTags, BlobSource } from '@asinnn/stamp-js';
 
 const res = await writeTags(new BlobSource(file), {
   title: '标题', artist: '作者', date: '2026-04-02T09:30:00Z',
@@ -74,8 +74,8 @@ Node 22 的 `fs.openAsBlob()` 对 ≥4 GiB 的文件把 size 截断成 32 位
 import fs from 'node:fs';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { writeTags } from 'stamp-js';
-import { NodeFileSource } from 'stamp-js/node';
+import { writeTags } from '@asinnn/stamp-js';
+import { NodeFileSource } from '@asinnn/stamp-js/node';
 
 const src = new NodeFileSource('huge.mp4');          // fstat 取真实 64 位大小
 const res = await writeTags(src, { title: '大文件' });
