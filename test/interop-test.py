@@ -389,6 +389,70 @@ if res.get('ok'):
               f'{res2["outputSize"]} vs {res["outputSize"]}')
 
 
+# --------------------------------------------------------------------------
+# D. Extended XMP：拿 exiftool 自己写出的分片做交叉验证
+#
+# exiftool 既是本套件的第三方基准，也是"扩展 XMP 命名空间到底是什么"的权威
+# 来源之一。让它自己写一个 >64 KiB 的 XMP（exiftool 会按规范拆成
+# StandardXMP + ExtendedXMP 分片），再把产物交给 stamp-js。
+#
+# 这条用例专门防一类隐患：库里识别分片用的常量如果写错（例如把
+# xap/extension 写成 xmp/extension，或反过来），只要**库自己的夹具和断言跟着
+# 一起写错**，整套测试依然全绿——只有拿第三方工具的真实产物来跑才拦得住。
+# --------------------------------------------------------------------------
+print('\n\033[1m▌ D. Extended XMP：exiftool 自行写出的分片 → stamp-js 处理 → exiftool 回读\033[0m\n')
+try:
+    from PIL import Image as _Image
+    _base = os.path.join(WORKDIR, 'ext_base.jpg')
+    _Image.new('RGB', (240, 180), (10, 60, 120)).save(_base, 'JPEG', quality=60)
+    _src = os.path.join(WORKDIR, 'ext_xmp.jpg')
+    subprocess.run(['exiftool', '-overwrite_original',
+                    '-XMP-dc:Description=' + 'X' * 70000,
+                    '-o', _src, _base],
+                   capture_output=True, text=True, timeout=120)
+    _blob = open(_src, 'rb').read()
+    check('扩展 XMP：exiftool 确实写出了一个 xmp/extension 分片 + HasExtendedXMP',
+          b'http://ns.adobe.com/xmp/extension/' in _blob and b'HasExtendedXMP' in _blob,
+          f'size={len(_blob)}')
+
+    _out = os.path.join(WORKDIR, 'ext_tagged.jpg')
+    _script = f"""
+import {{ writeTags, inspect, BlobSource }} from '{STAMP_JS}';
+import fs from 'node:fs';
+const blob = await fs.openAsBlob({json.dumps(_src)});
+const before = await inspect(new BlobSource(blob));
+const res = await writeTags(new BlobSource(blob), {{ title: 'ExtXmp', artist: 'asinnn' }});
+if (!res.ok) {{ console.error(JSON.stringify({{ok:false,error:res.report.error}})); process.exit(1); }}
+fs.writeFileSync({json.dumps(_out)}, Buffer.from(await res.blob.arrayBuffer()));
+console.log(JSON.stringify({{ ok:true,
+  fragments: (before.jpeg && before.jpeg.extendedXmpFragments) || 0,
+  removed: (res.report.xmp && res.report.xmp.staleExtendedFragments) || 0 }}));
+"""
+    _r = subprocess.run(['node', '--input-type=module', '-e', _script],
+                        capture_output=True, text=True, timeout=120)
+    _res = json.loads(_r.stdout.strip()) if _r.returncode == 0 and _r.stdout.strip() else {'ok': False}
+    check('扩展 XMP：写入成功', _res.get('ok') is True,
+          (_r.stderr or '').strip()[:150])
+    if _res.get('ok'):
+        check('扩展 XMP：inspect() 认得这些分片', _res.get('fragments', 0) > 0,
+              f"fragments={_res.get('fragments')}")
+        check('扩展 XMP：写入时按过期分片清除', _res.get('removed', 0) > 0,
+              f"removed={_res.get('removed')}")
+        _outb = open(_out, 'rb').read()
+        check('扩展 XMP：输出不再残留 xmp/extension 段',
+              b'http://ns.adobe.com/xmp/extension/' not in _outb)
+        check('扩展 XMP：输出不残留悬空的 HasExtendedXMP',
+              b'HasExtendedXMP' not in _outb)
+        _j = exiftool_read(_out) or {}
+        # -G（不带数字）给出的是组名，XMP 标签的键是 'XMP:Title'；带 -G1/-G2
+        # 时才是 'XMP-dc:Title'。两种都认，避免把键名差异当成功能失败。
+        _title = _j.get('XMP:Title') or _j.get('XMP-dc:Title')
+        check('扩展 XMP：exiftool 读回新标题', _title == 'ExtXmp', repr(_title))
+        check('扩展 XMP：主图像仍可解码',
+              _Image.open(_out).size == _Image.open(_src).size)
+except Exception as _e:
+    check('扩展 XMP 场景执行', False, str(_e)[:150])
+
 # 清理
 import shutil
 shutil.rmtree(WORKDIR, ignore_errors=True)

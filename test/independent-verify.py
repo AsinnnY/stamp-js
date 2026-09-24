@@ -719,11 +719,14 @@ try:
         old_std = [s for n, s in jpeg_seg_sizes(src) if n == 'XMP'][0]
         ext_total = sum(s for n, s in jpeg_seg_sizes(src) if n == 'XMPEXT')
         new_std = [s for n, s in after if n == 'XMP'][0]
-        # 本库还会补一段原生 EXIF（源文件本来没有），体积里必须算上
+        # 本库还会补/重写一段原生 EXIF。注意源文件本来就可能已有 EXIF（真实截图就有），
+        # 库是**原地重写**那一段，所以这里必须用「增量」而不是「输出中的总量」，
+        # 否则基底换成真实素材时这条断言会凭空差出原有 EXIF 段的大小。
+        old_exif = sum(s for n, s in jpeg_seg_sizes(src) if n == 'EXIF')
         new_exif = sum(s for n, s in after if n == 'EXIF')
-        check('扩展 XMP：体积变化 == 新包增量 - 被删分片 (+ 新增原生 EXIF)',
-              len(data) == os.path.getsize(src) - ext_total + (new_std - old_std) + new_exif,
-              f'{len(data)} != {os.path.getsize(src)} - {ext_total} + ({new_std} - {old_std}) + {new_exif}')
+        check('扩展 XMP：体积变化 == 新包增量 - 被删分片 (+ 原生 EXIF 增量)',
+              len(data) == os.path.getsize(src) - ext_total + (new_std - old_std) + (new_exif - old_exif),
+              f'{len(data)} != {os.path.getsize(src)} - {ext_total} + ({new_std} - {old_std}) + ({new_exif} - {old_exif})')
         check('扩展 XMP：主图像素未变', jpeg_pixels(src)[0] == jpeg_pixels(out)[0])
 except Exception as e:
     check('扩展 XMP 场景执行', False, str(e)[:120])

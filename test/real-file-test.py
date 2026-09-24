@@ -352,16 +352,28 @@ if res.get('ok'):
           f'got "{title_after}"')
     check('wx_camera MP4: duration preserved', after.get('QuickTime:Duration') == before.get('QuickTime:Duration'))
 
-    # 验证 hdlr 仍为 mdta（保持原风格）
+    # 验证 hdlr 仍为 mdta（保持原风格）。
+    # meta 既可能在 udta 内（iTunes 风格），也可能是 moov 的直接子盒
+    # （Android/MediaTek 风格）；两种都找，找不到就明确失败，而不是崩在 None[0] 上
+    # ——一次下标异常会把后面所有断言一起吞掉，等于没有信号。
     with open(out, 'rb') as f:
         da = f.read()
     moov_a = find_box(da, 'moov', 0, len(da))
-    udta_a = find_box(da, 'udta', moov_a[0] + moov_a[2], moov_a[0] + moov_a[1])
-    meta_a = find_box(da, 'meta', udta_a[0] + udta_a[2], udta_a[0] + udta_a[1])
-    h_a = find_box(da, 'hdlr', meta_a[0] + 12, meta_a[0] + meta_a[1])
-    hdlr_after = da[h_a[0] + 16:h_a[0] + 20].decode('latin1')
-    check(f'wx_camera MP4: hdlr still mdta (preserved style)', hdlr_after == hdlr_type,
-          f'{hdlr_type} -> {hdlr_after}')
+    meta_a = None
+    if moov_a:
+        udta_a = find_box(da, 'udta', moov_a[0] + moov_a[2], moov_a[0] + moov_a[1])
+        if udta_a:
+            meta_a = find_box(da, 'meta', udta_a[0] + udta_a[2], udta_a[0] + udta_a[1])
+        if not meta_a:
+            meta_a = find_box(da, 'meta', moov_a[0] + moov_a[2], moov_a[0] + moov_a[1])
+    h_a = find_box(da, 'hdlr', meta_a[0] + 12, meta_a[0] + meta_a[1]) if meta_a else None
+    if not h_a:
+        check('wx_camera MP4: hdlr still mdta (preserved style)', False,
+              f'meta/hdlr not found; moov={moov_a}')
+    else:
+        hdlr_after = da[h_a[0] + 16:h_a[0] + 20].decode('latin1')
+        check('wx_camera MP4: hdlr still mdta (preserved style)', hdlr_after == hdlr_type,
+              f'{hdlr_type} -> {hdlr_after}')
 
     # mdat 完整性
     mb = find_box(db, 'mdat', 0, len(db))
