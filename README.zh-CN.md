@@ -709,7 +709,7 @@ fragmented MP4 / CMAF
 MP4 keywords
 ```
 
-超过当前 64 KiB 单段限制的 XMP 也会被拒绝。读取和合并 Extended XMP 已经支持；写出 Extended XMP 属于后续扩展方向。
+超过当前 64 KiB 单段限制的 XMP 也会被拒绝。Extended XMP fragment 会被识别并清除（标准包一旦重建，分片就必然过期），但分片里的**内容不会被合并**进新包；写出 Extended XMP 属于后续扩展方向。
 
 C2PA / JUMBF 内容凭证当前不会随 metadata 写入而更新。依赖 Content Credentials 的应用应把元数据编辑视为会影响凭证状态的操作。
 
@@ -727,6 +727,14 @@ C2PA / JUMBF 内容凭证当前不会随 metadata 写入而更新。依赖 Conte
 
 长视频处理前可以先通过 `inspect().mp4.moovSize` 或 warning 判断。
 
+### Extended XMP 分片是清除，不是合并
+
+如果一张 JPEG 的 XMP 被拆成"标准包 + Extended XMP 分片"（Adobe 系写入器在超过 64 KiB 时的布局），那么写入后两者都不保留：标准包会按你传入的字段重建，而每个 `xmp/extension` 分片都会被删除——重建后的标准包不会声明 `xmpNote:HasExtendedXMP`，而 GUID 未被引用的分片按定义就是过期的。已用 exiftool 自己写出的文件验证（2 个分片）：两个都被清除、没有残留悬空的 `HasExtendedXMP`、exiftool 能正常读出结果。只存在于分片里的字段**不会**被带过来。
+
+### 源文件本来没有 EXIF 时会合成一个极简块
+
+当 JPEG 完全没有 EXIF 时，stamp-js 会合成一个极简 APP1 块，好让 `title` / `artist` / `copyright` 仍能出现在系统属性页里。该块只包含本次写入的字段，因此 `exiftool -validate` 会把相机 JPEG 里其它必需标签报为缺失（`0x9101` ComponentsConfiguration、`0xa001` ColorSpace、`0xa002`/`0xa003` 图像尺寸、`0x0213` YCbCrPositioning，共 5 条告警；实测于 `1940534161.jpeg`，该文件写入前验证是干净的）。本来就有 EXIF 的文件不受影响：重写是追加式的，同一次验证中相机照片原有的 61 条告警反而降到 60 条。
+
 ### Node stream 生命周期
 
 `NodeFileSource` 在输出 `ReadableStream` 被消费时才会继续读取文件。因此不要在流真正消费完之前关闭 source。
@@ -737,9 +745,9 @@ C2PA / JUMBF 内容凭证当前不会随 metadata 写入而更新。依赖 Conte
 
 这个版本包含多层验证：单元与回归、畸形输入、第三方工具互操作、真实设备素材和独立验证。
 
-| 套件 | 命令 | 0.1.0 包当前断言规模 |
+| 套件 | 命令 | 本版本（0.1.1）断言规模 |
 |---|---|---:|
-| 单元 + 回归 | `npm test` | 基线 323 / Node 20/22 为 340 |
+| 单元 + 回归 | `npm test` | Node 20/22 为 387 |
 | 畸形 / fuzz 矩阵 | `npm run test:fuzz` | 196 |
 | 互操作（`exiftool` + Pillow） | `npm run test:interop` | 38 |
 | 真实设备文件 | `npm run test:real` | 34 |

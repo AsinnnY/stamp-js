@@ -699,7 +699,7 @@ fragmented MP4 / CMAF
 MP4 keyword writing
 ```
 
-XMP writes above the supported 64 KiB single-segment limit are also refused. Extended XMP reading/merging is supported; writing Extended XMP is a future extension.
+XMP writes above the supported 64 KiB single-segment limit are also refused. Extended XMP fragments are recognised and removed — a fragment is stale the moment the standard packet is replaced — but their *content* is not merged into the rebuilt packet, and writing Extended XMP is a future extension.
 
 C2PA / JUMBF manifests are not updated by metadata writes. Applications that depend on content credentials should treat a metadata edit as a credential-affecting operation.
 
@@ -717,6 +717,29 @@ Large recordings can have large sample tables and therefore a larger `moov`. The
 
 Use `inspect().mp4.moovSize` or the warning field before writing when processing long recordings.
 
+### Extended XMP fragments are dropped, not merged
+
+A JPEG whose XMP was split into a standard packet plus Extended XMP fragments
+(the >64 KiB layout Adobe writers produce) ends up with neither: the standard
+packet is rebuilt from the fields you pass, and every `xmp/extension` fragment is
+removed, because the rebuilt packet never declares `xmpNote:HasExtendedXMP` and a
+fragment whose GUID is not referenced is stale by definition. Verified against a
+file written by exiftool itself (2 fragments): both were removed, no dangling
+`HasExtendedXMP` was left behind, and exiftool reads the result. Fields that
+existed *only* inside the fragments are not carried over.
+
+### Synthesized EXIF on a file that has none
+
+When a JPEG carries no EXIF at all, stamp-js creates a minimal APP1 block so that
+`title` / `artist` / `copyright` still reach OS property sheets. That block
+contains only the fields being written, so `exiftool -validate` reports the other
+ExifIFD/IFD0 tags it expects in a camera JPEG as missing (`0x9101`
+ComponentsConfiguration, `0xa001` ColorSpace, `0xa002`/`0xa003` image
+dimensions, `0x0213` YCbCrPositioning — 5 warnings, measured on
+`1940534161.jpeg`, which validated clean before the write). A file that already
+had EXIF is unaffected: the rewrite is append-only and the same verification run
+saw a camera JPEG's 61 pre-existing warnings *drop* to 60.
+
 ### Node stream lifetime
 
 `NodeFileSource` performs lazy reads while the output `ReadableStream` is consumed. Do not close the source before the stream is completely drained.
@@ -727,9 +750,9 @@ Use `inspect().mp4.moovSize` or the warning field before writing when processing
 
 The package includes several verification layers covering unit behavior, malformed inputs, interoperability and real media.
 
-| Suite | Command | Current assertion count in the 0.1.0 package |
+| Suite | Command | Assertion count in this release (0.1.1) |
 |---|---|---:|
-| Unit + regression | `npm test` | 323 baseline / 340 on Node 20/22 |
+| Unit + regression | `npm test` | 387 on Node 20/22 |
 | Malformed / fuzz matrix | `npm run test:fuzz` | 196 |
 | Interop (`exiftool` + Pillow) | `npm run test:interop` | 38 |
 | Real device files | `npm run test:real` | 34 |

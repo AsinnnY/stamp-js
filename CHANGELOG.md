@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.1.1] - 2026-09-24
+
 ### Added
 - **PNG `eXIf` chunk.** PNG gets the same native fields as JPEG (`0x010E`,
   `0x013B`, `0x8298`) plus `UserComment`, written into an `eXIf` chunk. The date
@@ -35,8 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `report.warnings` and still gets its XMP. Deliberately not mirrored: `software`
   (0x0131 is the camera firmware string), ExifIFD `DateTimeOriginal` (the real
   capture time = Explorer's "Date taken"), and `comment`/`url`/`keywords`.
-  `options.nativeExif: false` opts out. `exiftool -validate` stays OK, and
-  verified against 4 real camera files (GPS + Apple MakerNotes intact).
+  `options.nativeExif: false` opts out. Writing into a file that already carried
+  EXIF adds no `exiftool -validate` warning (a camera JPEG's pre-existing 61
+  warnings became 60); a file that had *no* EXIF gets a minimal block, which
+  `-validate` reports as missing the other tags it expects — see the README's
+  limitations section.
 - **Malformed / fuzz matrix** (`npm run test:fuzz`, 196 assertions). Corrupt
   JPEG / PNG / MP4 inputs are checked against five invariants instead of
   hand-written expectations: no throw, refusal carries a reason + `errorCode`
