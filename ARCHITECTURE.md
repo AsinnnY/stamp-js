@@ -29,7 +29,11 @@ Source (abstract)
 ```
 
 The `stats` object (`readCalls`, `bytesRead`, `maxReadSize`, `sliceCalls`)
-makes memory behavior measurable and testable.
+makes memory behavior measurable and testable. `report.stats` is a *live* view
+of it — it keeps counting while the caller consumes the output stream, since
+piping to disk really does read the whole file. `report.planning` carries the
+same counters pinned when the plan finished, which is the number that backs the
+"reads only the header + moov" claim.
 
 ### Large files: why `NodeFileSource` exists
 
@@ -259,11 +263,18 @@ When the file already contains udta/meta/ilst:
 - **Anything that cannot be fully traversed is refused.** `listChildrenEx()`
   reports a chain that does not tile its range exactly (a box with `size < 8`,
   a box running past its parent, or leftover bytes). A malformed
-  `moov`/`meta`/`ilst`/`keys` subtree, or a numeric index that does not resolve
-  in its own keys table, marks the moov unparseable and `writeTags()` refuses
-  with the reason. Stopping at the bad box and rewriting anyway would drop
-  everything after it while still reporting success — the failure mode this
-  check exists to prevent.
+  `moov`/`udta`/`meta`/`ilst`/`keys` subtree, or a numeric index that does not
+  resolve in its own keys table, marks the moov unparseable and `writeTags()`
+  refuses with the reason. Stopping at the bad box and rewriting anyway would
+  drop everything after it while still reporting success — the failure mode this
+  check exists to prevent. The `udta` case is checked for *every* udta that is
+  going to be rewritten, in both the merged and the in-place path, so the rule
+  holds whichever strategy the file ends up taking.
+- **Non-meta children of a rewritten udta are carried over, never dropped.**
+  Vendor boxes and QuickTime `©tag` atoms living beside `meta` are not metadata
+  this library understands, but they are data it must not lose; they are
+  re-emitted verbatim in the rebuilt udta. `free` is the exception: it is pure
+  padding, and carrying it would make repeated writes grow the file.
 
 `inspect()` surfaces the same check as `mp4.safeToWrite: false` together with an
 `mp4.metadataMalformed` reason, so a caller can pre-check before writing.
@@ -314,12 +325,15 @@ byte insertions. This list can be materialized two ways:
 | Fragmented (moof/sidx) | **Refuse** (offsets in trun/saio/sidx would break) |
 | moov uses 64-bit largesize header | **Refuse** (not yet supported) |
 | Multiple udta | Merge all; rebase mdta indices; preserve unknown content | 
+| Non-meta children beside `meta` in a rewritten udta | Carry over verbatim (`free` padding dropped) |
+| udta whose child chain does not tile its range | **Refuse** (rewriting it would drop the bytes after the bad box) |
 | `moov/meta` (Android/MediaTek) | Update in place, keep its QuickTime/ISO layout |
 | Mixed mdir + mdta containers | Update each in its own format (never merge) |
 | Field the container cannot store (MP4 `keywords`) | **Refuse**, name it in `unsupportedTags` |
 | udta without a meta box | Leave byte-identical (refuse if it holds ©tag atoms) |
 | Malformed metadata tree | **Refuse** (never rewrite a partly understood tree) |
 | mdta freeform (`----`) entries | Preserve (never dropped) |
+| Net moov growth not a multiple of 8 | Pad the appended udta so the mdat shift stays 8-aligned |
 | JPEG with a parseable MPF index | Rebase MPEntry lengths/offsets |
 | JPEG with an unparseable MPF index | **Refuse** (never leave a dangling index) |
 | JPEG with Extended XMP fragments | Drop them with the packet they belong to |
@@ -327,7 +341,15 @@ byte insertions. This list can be materialized two ways:
 | AVIF / HEIC (ISOBMFF ftyp brands) | **Refuse**, naming the detected brand |
 | WebP / WebM / MKV / MP3 / FLAC | **Refuse**, naming the container and why |
 | HTTP without Range | **Refuse** random access |
+| URL that cannot be opened (DNS, refused, TLS) | **Report** `SOURCE_UNREACHABLE` — never throws |
+| Source type the API does not recognize | **Report** `UNSUPPORTED_SOURCE` — never throws |
+| `HttpSource` used without `init()` | **Report** `SOURCE_NOT_READY`, naming the missing call |
 | Source reports a size it cannot back up | Nothing to detect — see `NodeFileSource` |
+
+`writeTags()` never throws and always returns a report object: an unreachable
+source is a *refusal with a reason*, the same as an unsupported container, in
+line with the "refuse, never silently damage" rule above. `inspect()` follows
+the same contract and answers with `format: 'unknown'` plus `error`/`errorCode`.
 
 ## Testing strategy
 
