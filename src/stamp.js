@@ -161,6 +161,11 @@ export class HttpSource extends Source {
     this.rangeSupported = null;
   }
   async init() {
+    // A caller who already knows the size deliberately skips the probe
+    // round-trip. rangeSupported then stays null ("not yet known"), and the
+    // first read() settles it: a server that ignores the Range header does not
+    // answer 206, and read() refuses with RANGE_UNSUPPORTED before any
+    // misaligned bytes can reach the parser.
     if (this.size) return this;
     const res = await this.fetchImpl(this.url, { headers: { Range: 'bytes=0-0' } });
     try {
@@ -596,22 +601,32 @@ function buildMetaBox(source, tags, targetFormat) {
  * place rather than merged into one appended udta.
  */
 function replaceUdtaMeta(bytes, udta, metaBytes) {
-  const kids = listChildrenEx(bytes, udta.pos + 8, udta.end).children;
-  const parts = kids.map((k) => (k.type === 'meta' ? metaBytes : bytes.slice(k.pos, k.end)));
+  // The udta is being rebuilt from its children, so a child chain that does not
+  // tile the box means we would silently drop everything after the bad box.
+  // listChildrenEx() reports exactly that; refuse instead of writing a file
+  // whose udta has quietly lost bytes.
+  const kidsEx = listChildrenEx(bytes, udta.pos + 8, udta.end);
+  if (kidsEx.malformed) {
+    throw fail('MALFORMED_CONTAINER',
+      `REFUSE: udta box at offset ${udta.pos} cannot be fully traversed (${kidsEx.reason}); `
+      + 'rewriting it would silently drop the bytes after the malformed box');
+  }
+  const parts = kidsEx.children.map((k) => (k.type === 'meta' ? metaBytes : bytes.slice(k.pos, k.end)));
   return mp4Box('udta', cat(parts));
 }
 
 /**
- * Wrap meta inside udta, padded with a free box so that the total udta size
- * is a multiple of 8. This ensures the moov growth is 8-aligned, so mdat
- * does not become misaligned (some legacy players / hardware decoders are
- * sensitive to sample data alignment).
+ * Wrap meta inside udta, carrying over any non-meta children the merged udta
+ * boxes held (vendor boxes, QuickTime (c)tag atoms) so a merge cannot drop them.
+ *
+ * No padding is applied here. Aligning the *new udta* alone is not sufficient:
+ * under faststart the mdat moves by the net change of the whole moov, which
+ * also covers the udta boxes being replaced and any moov/meta box that changes
+ * length in place. The 8-byte alignment is applied once, to that net change,
+ * after every edit is planned (see the ops post-processing in planMp4).
  */
-function wrapUdta(metaBytes) {
-  let inner = metaBytes;
-  const pad = (8 - ((8 + inner.length) % 8)) % 8;
-  if (pad) inner = cat([inner, mp4Box('free', new Uint8Array(pad))]);
-  return mp4Box('udta', inner);
+function wrapUdta(metaBytes, extraChildren = []) {
+  return mp4Box('udta', cat([metaBytes, ...extraChildren]));
 }
 
 function buildHdlr(handlerType) {
@@ -1591,11 +1606,31 @@ function parseExistingIlst(moovBytes) {
   const udtas = [];        // udta boxes that contain meta (rewritten on write)
   const containers = [];   // metadata boxes to read from / write back to
   const ignoredUdtas = []; // udta boxes without meta: preserved, never rewritten
+  const udtaExtras = [];   // non-meta children of a rewritten udta: carried over verbatim
 
   for (const k of moovKids.children) {
     if (k.type === 'udta') {
       const meta = findChild(moovBytes, k.pos + 8, 'meta', k.end);
       if (meta) {
+        // This udta is going to be rebuilt from its children, so its chain has
+        // to tile the box exactly: anything after a box with a bad size would
+        // be dropped without a word. Catching it here refuses the write before
+        // any planning happens, and covers both the in-place and merged paths.
+        const kidsEx = listChildrenEx(moovBytes, k.pos + 8, k.end);
+        if (kidsEx.malformed) {
+          return {
+            udtas, containers, ignoredUdtas, hasMetadata: true, unparseable: true,
+            reason: `udta box at offset ${k.pos} cannot be fully traversed (${kidsEx.reason})`,
+          };
+        }
+        // Siblings of meta (vendor boxes, QuickTime (c)tag atoms, …) are not
+        // metadata we understand, but they are data we must not lose: carry the
+        // bytes over into the rebuilt udta. `free` is pure padding, and carrying
+        // it would make repeated writes grow the file, so it is dropped.
+        for (const c of kidsEx.children) {
+          if (c.type === 'meta' || c.type === 'free') continue;
+          udtaExtras.push(moovBytes.slice(c.pos, c.end));
+        }
         udtas.push(k);
         containers.push({ meta, label: `udta@${k.pos}/meta`, udta: k });
         continue;
@@ -1714,7 +1749,7 @@ function parseExistingIlst(moovBytes) {
   const mixedHandlers = hdlrTypes.size > 1;
 
   return {
-    udtas, containers, ignoredUdtas,
+    udtas, containers, ignoredUdtas, udtaExtras,
     hasMetadata: containers.length > 0,
     hdlrType, keys, entries, extraMetaChildren,
     hdlrTypes: [...hdlrTypes], mixedHandlers,
@@ -1771,6 +1806,14 @@ function patchChunkOffsets(bytes, moovStart, moovEnd, delta, threshold, report) 
           if (v >= threshold) {
             const nv = v + delta;
             if (nv < 0) { needCo64 = true; return; }
+            // u64() keeps *stored* offsets below 2^53, but adding delta can cross
+            // that line. BigInt(nv) would then silently encode a rounded Number,
+            // i.e. write an imprecise sample offset. Refuse instead — this needs
+            // a petabyte-scale file, so it is a guard, not a real limitation.
+            if (nv > Number.MAX_SAFE_INTEGER) {
+              throw fail('UNSUPPORTED_LARGESIZE',
+                `sample offset ${v} + ${delta} exceeds 2^53; refusing to write an imprecise offset`);
+            }
             dv.setBigUint64(off, BigInt(nv));
             patched++;
           }
@@ -2053,6 +2096,7 @@ export async function planMp4(src, tags, report, opts = {}, seed) {
 
   const ops = [];
   let preservedTotal = 0;
+  let appendOp = null;   // the op that inserts a fresh udta, if any (used for 8-byte alignment)
   if (splitContainers) {
     for (const c of existing.containers) {
       const format = c.hdlrType || 'mdir';
@@ -2077,7 +2121,8 @@ export async function planMp4(src, tags, report, opts = {}, seed) {
         report.warnings.push(`moov has ${existing.udtas.length} udta meta containers (legacy); merged into 1`);
       }
       for (const c of existing.udtas) ops.push({ start: c.pos, end: c.end, bytes: null });
-      ops.push({ start: moov.length, end: moov.length, bytes: wrapUdta(metaIso) });
+      appendOp = { start: moov.length, end: moov.length, bytes: wrapUdta(metaIso, existing.udtaExtras) };
+      ops.push(appendOp);
     }
     for (const c of existing.containers) {
       if (c.label === 'moov/meta') {
@@ -2085,7 +2130,13 @@ export async function planMp4(src, tags, report, opts = {}, seed) {
         ops.push({ start: c.meta.pos, end: c.meta.end, bytes: own });
       }
     }
-    if (!ops.length) ops.push({ start: moov.length, end: moov.length, bytes: wrapUdta(metaIso) });
+    if (!ops.length) {
+      appendOp = { start: moov.length, end: moov.length, bytes: wrapUdta(metaIso, existing.udtaExtras) };
+      ops.push(appendOp);
+    }
+    if (existing.udtaExtras.length) {
+      report.notes.push(`carried over ${existing.udtaExtras.length} non-meta child box(es) of the rewritten udta`);
+    }
   }
 
   if (hasMetadata) {
@@ -2097,6 +2148,27 @@ export async function planMp4(src, tags, report, opts = {}, seed) {
   }
   if (existing.ignoredUdtas.length) {
     report.notes.push(`left ${existing.ignoredUdtas.length} udta box(es) without a meta box untouched`);
+  }
+
+  // ---- 8-byte alignment of the *net* moov growth -------------------------
+  // Under faststart mdat moves by exactly the net change of moov, and some
+  // legacy players / hardware decoders are sensitive to sample-data alignment.
+  // Aligning the new udta is not enough: the boxes it replaces may not have
+  // been 8-aligned, and a moov/meta box rewritten in place can change length
+  // too. Pad the append op with a `free` box so the total change is a multiple
+  // of 8; if nothing is being appended, append the padding to moov itself.
+  {
+    let netGrowth = 0;
+    for (const op of ops) netGrowth += (op.bytes ? op.bytes.length : 0) - (op.end - op.start);
+    const rem = ((netGrowth % 8) + 8) % 8;
+    if (rem !== 0) {
+      const padBox = mp4Box('free', new Uint8Array(8 - rem));   // total length 16 - rem
+      if (appendOp) {
+        appendOp.bytes = mp4Box('udta', cat([appendOp.bytes.subarray(8), padBox]));
+      } else {
+        ops.push({ start: moov.length, end: moov.length, bytes: padBox });
+      }
+    }
   }
 
   ops.sort((a, b) => a.start - b.start);
@@ -2211,7 +2283,9 @@ export function partsToStream(src, parts, chunkSize = 4 << 20) {
         const from = p.start + offsetInRef;
         const to = Math.min(p.end, from + chunkSize);
         if (from >= p.end) { i++; offsetInRef = 0; continue; }
-        const buf = await src.read(from, to);
+        // _read() (not read()) so streamed bytes land in src.stats like every
+        // other read; report.stats is a live view of it (see writeTags).
+        const buf = await src._read(from, to);
         offsetInRef = to - p.start;
         controller.enqueue(buf);
         return;
@@ -2228,7 +2302,30 @@ export function partsToStream(src, parts, chunkSize = 4 << 20) {
 /** Probe: writes nothing. Returns format, safety assessment, and estimated
  *  byte change. */
 export async function inspect(source) {
+  // inspect() is the documented pre-check for a write ("will this be refused?"),
+  // so it must not throw for the same reasons writeTags() must not: an
+  // unreachable URL or an unreadable source has to come back as an info object
+  // carrying the reason.
+  const holder = { src: null };
+  try {
+    return await inspectSource(source, holder);
+  } catch (e) {
+    const src = holder.src;
+    return {
+      format: 'unknown',
+      size: src ? src.size : 0,
+      mime: src ? (src.type || '') : '',
+      capabilities: capabilities('unknown'),
+      error: String((e && e.message) || e),
+      ...(e && e.code ? { errorCode: e.code } : {}),
+      readStats: src ? { ...src.stats } : null,
+    };
+  }
+}
+
+async function inspectSource(source, holder) {
   const src = await normalizeSource(source);
+  holder.src = src;
   const head = await readHeadAt(src, 16, null);
   const format = sniff(head, src.type);
   const info = { format, size: src.size, mime: src.type || '', capabilities: capabilities(format) };
@@ -2334,10 +2431,15 @@ function findStsd(moov) {
       })();
     }
     let codec = null, video = null;
-    if (stsd && u32(moov, stsd.pos + 12) > 0) {
+    // Read only what is provably inside the stsd box. A sample entry is
+    // variable-length (visual entries are 78 bytes + extensions, audio entries
+    // differ), so a truncated or non-standard entry would otherwise have us
+    // read a neighbouring box's bytes — or zeros — and report a plausible but
+    // wrong codec/resolution. Out of bounds means "unknown", never a guess.
+    if (stsd && stsd.pos + 16 <= stsd.end && u32(moov, stsd.pos + 12) > 0) {
       const entry = stsd.pos + 16;
-      codec = fourcc(moov, entry + 4);
-      if (handler === 'vide') {
+      if (entry + 8 <= stsd.end) codec = fourcc(moov, entry + 4);      // entry: size(4) + format(4)
+      if (handler === 'vide' && entry + 36 <= stsd.end) {
         video = { width: u16(moov, entry + 32), height: u16(moov, entry + 34) };
       }
     }
@@ -2357,9 +2459,27 @@ function findStsd(moov) {
  * @returns {Promise<{ok:boolean, blob?:Blob, stream?:ReadableStream, parts?:Array, report:Object, error?:string}>}
  */
 export async function writeTags(source, tags, opts = {}) {
-  const report = { format: null, strategy: null, notes: [], warnings: [], stats: null };
-  const src = await normalizeSource(source);
+  // report.stats is a live view of the source's counters rather than a snapshot:
+  // the output is lazy (a ReadableStream is consumed after this function
+  // returns), so a snapshot taken here would always understate the reads. It
+  // reads a fresh copy on each access, and assigning to it pins an explicit
+  // snapshot (used by the error path, where there may be no source at all).
+  let src = null;
+  let statsOverride;
+  const report = { format: null, strategy: null, notes: [], warnings: [] };
+  Object.defineProperty(report, 'stats', {
+    enumerable: true,
+    get: () => (statsOverride !== undefined ? statsOverride : (src ? { ...src.stats } : null)),
+    set: (v) => { statsOverride = v; },
+  });
   try {
+    // Opening the source is inside the try block on purpose: a URL string makes
+    // this a real network round-trip that can fail (DNS, connection refused,
+    // TLS, a server that answers with a malformed Content-Range). The contract
+    // of writeTags() is "never throw, always report", and the callers of this
+    // documented path check `result.ok` — so an unreachable URL has to come back
+    // as {ok:false, report:{errorCode}}, not as a rejected promise.
+    src = await normalizeSource(source);
     // 16 bytes are enough to identify the container; these bytes are passed
     // as a seed to downstream planners to avoid re-reading.
     const head = await readHeadAt(src, 16, null);
@@ -2420,6 +2540,15 @@ export async function writeTags(source, tags, opts = {}) {
         ? { existingContainers: report.probe.metadataContainers } : {}),
     };
     report.offsets = { shifted: size !== src.size, delta: size - src.size, ...(plan.offsets || {}) };
+    // What the *metadata surgery* cost, fixed at the moment planning finished.
+    // report.stats is a live view that keeps counting while the caller consumes
+    // the output (piping a stream to disk legitimately reads the whole file), so
+    // the headline "reads only the header + moov" number has to be pinned here.
+    report.planning = {
+      readCalls: src.stats.readCalls,
+      bytesRead: src.stats.bytesRead,
+      maxReadSize: src.stats.maxReadSize,
+    };
 
     if (opts.materialize === false) {
       report.stats = { ...src.stats };
@@ -2434,25 +2563,80 @@ export async function writeTags(source, tags, opts = {}) {
       report.notes.push(`output as Blob: ${parts.length} slices assembled by reference`);
     } else {
       out.stream = partsToStream(src, parts, opts.chunkSize);
-      report.stats = { ...src.stats };
+      // No snapshot here: the stream is lazy, so report.stats stays live and
+      // reflects the reads that actually happen while it is consumed.
       report.notes.push('output as ReadableStream (source does not support local slicing; pipe to file system writer)');
     }
     return out;
   } catch (e) {
     report.error = String((e && e.message) || e);
     if (e && e.code) report.errorCode = e.code;
-    report.stats = { ...src.stats };
+    // Normalizing the source may itself have failed, in which case there is no
+    // source to report counters for.
+    report.stats = src ? { ...src.stats } : null;
     return { ok: false, report };
   }
 }
 
 async function normalizeSource(source) {
-  if (source instanceof Source) return source;
+  if (source instanceof Source) {
+    // An HttpSource that was constructed but never init()ed reports size 0 and
+    // does not know whether ranges are supported, so sniffing calls it "unknown
+    // format" — a confusing way to say "you forgot to await init()". Name the
+    // real problem instead.
+    if (source instanceof HttpSource && source.rangeSupported === null && !source.size) {
+      throw fail('SOURCE_NOT_READY',
+        'this HttpSource has not been initialized; `await new HttpSource(url).init()` is required '
+        + 'before use (init() resolves the size and whether the server supports Range requests)');
+    }
+    return source;
+  }
   if (source instanceof Uint8Array || source instanceof ArrayBuffer) return new BufferSource(source);
   if (typeof Blob === 'function' && source instanceof Blob) return new BlobSource(source);
-  if (typeof source === 'string') return new HttpSource(source).init();
-  if (source && typeof source.read === 'function' && typeof source.size === 'number') return source;
-  throw new TypeError('unrecognized data source');
+  if (typeof source === 'string') {
+    const http = new HttpSource(source);
+    try {
+      return await http.init();
+    } catch (e) {
+      // Keep the library's own codes (RANGE_UNSUPPORTED, RANGE_MISMATCH, …) and
+      // label transport-level failures (DNS, connection refused, TLS) with a
+      // stable code of their own, so a caller can branch on report.errorCode.
+      if (e && e.code) throw e;
+      throw fail('SOURCE_UNREACHABLE',
+        `could not open ${source} as a random-access source: ${(e && e.message) || e}`);
+    }
+  }
+  if (source && typeof source.read === 'function' && typeof source.size === 'number') {
+    // A hand-rolled source only has to provide read() and size. Give it the
+    // bounds-checked, counted _read() the planners call: previously such a
+    // source was accepted here and then failed deep inside a planner with
+    // "src._read is not a function", which is an incomprehensible way to
+    // reject an input the entry point just said it understood.
+    const wrapped = {
+      size: source.size,
+      type: source.type || '',
+      stats: { readCalls: 0, bytesRead: 0, maxReadSize: 0, sliceCalls: 0 },
+      canSlice: () => (typeof source.canSlice === 'function' ? !!source.canSlice() : false),
+      slice: typeof source.slice === 'function'
+        ? (start, end) => { wrapped.stats.sliceCalls++; return source.slice(start, end); }
+        : () => { throw new Error('this source does not support reference slicing'); },
+      read: (start, end) => source.read(start, end),
+      async _read(start, end) {
+        start = Math.max(0, Math.floor(start));
+        end = Math.min(wrapped.size, Math.ceil(end));
+        if (!(end > start)) return new Uint8Array(0);
+        const out = await wrapped.read(start, end);
+        wrapped.stats.readCalls++;
+        wrapped.stats.bytesRead += out.length;
+        if (out.length > wrapped.stats.maxReadSize) wrapped.stats.maxReadSize = out.length;
+        return out;
+      },
+    };
+    return wrapped;
+  }
+  throw fail('UNSUPPORTED_SOURCE',
+    'unrecognized data source: expected a URL string, a Blob, a Uint8Array/ArrayBuffer, '
+    + 'a stamp-js Source, or an object exposing read() and size');
 }
 
 export default { writeTags, inspect, capabilities, TAG_FIELDS, planJpeg, planPng, planMp4, probeMp4, parseMpf, rebaseMpf, Source, BlobSource, BufferSource, HttpSource, partsToStream, buildXmpPacket };

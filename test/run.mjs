@@ -2024,5 +2024,167 @@ section('J. Input validation and format clarity');
 }
 
 /* ===================================================================== */
+section('K. Review fixes: error boundaries, no silent data loss, alignment');
+{
+  const cat = (...a) => { const f = a.flat(); const n = f.reduce((s, c) => s + c.length, 0); const o = new Uint8Array(n); let p = 0; for (const c of f) { o.set(c, p); p += c.length; } return o; };
+  const u32b = (n) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+  const ascii = (s) => new Uint8Array([...s].map((c) => c.charCodeAt(0) & 255));
+  const zeros = (n) => new Uint8Array(n);
+  const box = (t, ...b) => { const x = cat(...b); return cat(u32b(8 + x.length), ascii(t), x); };
+  const full = (t, ...b) => { const x = cat(...b); return cat(u32b(12 + x.length), ascii(t), zeros(4), x); };
+  const datab = (v) => { const p = ascii(v); return cat(u32b(16 + p.length), ascii('data'), u32b(1), u32b(0), p); };
+  const idxb = (i, v) => { const p = ascii(v); const inner = cat(u32b(16 + p.length), ascii('data'), u32b(1), u32b(0), p); return cat(u32b(8 + inner.length), new Uint8Array([0, 0, 0, i]), inner); };
+  const hdlr = (h) => full('hdlr', zeros(4), ascii(h), zeros(12), zeros(1));
+  const FTYP = () => cat(u32b(32), ascii('ftyp'), ascii('isom'), u32b(0x200), ascii('isom'), ascii('iso2'), ascii('avc1'), ascii('mp41'));
+  const MVHD = () => cat(u32b(108), ascii('mvhd'), zeros(100));
+  const MDAT = () => cat(u32b(8 + 256), ascii('mdat'), zeros(256).fill(0x42));
+  const MDIR_META = () => full('meta', hdlr('mdir'), box('ilst', box('\xa9cmt', datab('C-comment'))));
+  const MDTA_META_QT = () => box('meta', hdlr('mdta'), full('keys', u32b(1), cat(u32b(8 + 5), ascii('mdta'), ascii('genre'))), box('ilst', idxb(1, 'M-genre')));
+  const canaryRuns = (b, n = 12) => { let k = 0; for (let i = 0; i + n <= b.length; i++) { let all = true; for (let j = 0; j < n; j++) if (b[i + j] !== 0x5a) { all = false; break; } if (all) { k++; i += n - 1; } } return k; };
+  const mdatOffset = (b) => b.findIndex((v, i) => i > 0 && b[i] === 0x6d && b[i + 1] === 0x64 && b[i + 2] === 0x61 && b[i + 3] === 0x74) - 4;
+  const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+
+  // ---- 1) a source that cannot be opened is *reported*, never thrown ----
+  // writeTags()'s documented contract is "always returns an object, callers test
+  // result.ok"; a URL string is the documented usage, so an unreachable host or
+  // a malformed Content-Range has to come back in report.errorCode.
+  const res1 = await writeTags(12345, { title: 'x' });
+  check('K1 unrecognized source: {ok:false}, no thrown TypeError', res1.ok === false, JSON.stringify(res1).slice(0, 150));
+  check('K1 unrecognized source: errorCode UNSUPPORTED_SOURCE', res1.report.errorCode === 'UNSUPPORTED_SOURCE', String(res1.report.errorCode));
+
+  const realFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => { throw new TypeError('fetch failed'); };
+    const res2 = await writeTags('http://example.invalid/x.mp4', { title: 'x' });
+    check('K1 unreachable URL: {ok:false}, not a rejected promise', res2.ok === false, JSON.stringify(res2).slice(0, 150));
+    check('K1 unreachable URL: errorCode SOURCE_UNREACHABLE', res2.report.errorCode === 'SOURCE_UNREACHABLE', String(res2.report.errorCode));
+    const info = await inspect('http://example.invalid/x.mp4');
+    check('K1 inspect(unreachable URL): info object carrying the reason',
+      info.format === 'unknown' && info.errorCode === 'SOURCE_UNREACHABLE', JSON.stringify(info).slice(0, 150));
+
+    globalThis.fetch = async () => ({ status: 206, headers: { get: () => 'bytes garbage' }, body: { cancel() {} } });
+    const res3 = await writeTags('http://x/y.mp4', { title: 'x' });
+    check('K1 malformed Content-Range: refused in-report, not thrown',
+      res3.ok === false && res3.report.errorCode === 'RANGE_UNSUPPORTED', JSON.stringify(res3).slice(0, 150));
+
+    globalThis.fetch = async () => ({ status: 200, headers: { get: (k) => (String(k).toLowerCase() === 'content-length' ? '1000' : null) }, body: { cancel() {} } });
+    const res4 = await writeTags('http://x/y.mp4', { title: 'x' });
+    check('K1 no-Range server via URL string: refused in-report',
+      res4.ok === false && res4.report.errorCode === 'RANGE_UNSUPPORTED', JSON.stringify(res4).slice(0, 150));
+
+    // A constructed-but-uninitialised source must be named, not misread as
+    // "unknown format"; it must not even reach the network.
+    const notInit = new HttpSource('http://x/y.mp4');
+    const res5 = await writeTags(notInit, { title: 'x' });
+    check('K1 HttpSource not init()ed: SOURCE_NOT_READY naming the fix',
+      res5.ok === false && res5.report.errorCode === 'SOURCE_NOT_READY' && /init\(\)/.test(res5.report.error || ''),
+      JSON.stringify(res5).slice(0, 200));
+    const info5 = await inspect(notInit);
+    check('K1 inspect(HttpSource not init()ed): same code, no throw', info5.errorCode === 'SOURCE_NOT_READY', JSON.stringify(info5).slice(0, 150));
+  } finally { globalThis.fetch = realFetch; }
+
+  const info2 = await inspect(12345);
+  check('K1 inspect(unrecognized source): info object, no throw',
+    info2.format === 'unknown' && info2.errorCode === 'UNSUPPORTED_SOURCE', JSON.stringify(info2).slice(0, 150));
+
+  // ---- 2) a udta that cannot be fully traversed is refused ----
+  // It used to be rebuilt from a truncated child list while still reporting
+  // ok:true, i.e. bytes after the malformed box disappeared silently.
+  const siblingCase = (sibling, withMdta) => {
+    const udta = box('udta', MDIR_META(), sibling);
+    const moov = withMdta ? box('moov', MVHD(), udta, MDTA_META_QT()) : box('moov', MVHD(), udta);
+    return cat(FTYP(), moov, MDAT());
+  };
+  const VENDOR = box('xxxx', zeros(12).fill(0x5a));
+  const CORRUPT = cat(u32b(4), ascii('skip'), zeros(8).fill(0x5a));   // declares size 4 (< 8)
+  for (const [label, withMdta] of [['merged', false], ['in-place', true]]) {
+    const bad = await writeTags(new BlobSource(new Blob([siblingCase(CORRUPT, withMdta)])), { title: 'x' });
+    check(`K2 malformed udta sibling (${label}): refused with MALFORMED_CONTAINER`,
+      bad.ok === false && bad.report.errorCode === 'MALFORMED_CONTAINER', JSON.stringify(bad.report).slice(0, 170));
+    check(`K2 malformed udta sibling (${label}): no output produced`, !bad.blob && !bad.stream && !bad.parts);
+
+    const good = await writeTags(new BlobSource(new Blob([siblingCase(VENDOR, withMdta)])), { title: 'x' });
+    const out = good.ok ? await bytesOf(good) : new Uint8Array(0);
+    check(`K2 valid udta sibling (${label}): carried over verbatim`, good.ok && canaryRuns(out) === 1,
+      `ok=${good.ok} kept=${canaryRuns(out)} ${good.report && good.report.error}`);
+    const again = good.ok ? await writeTags(new BlobSource(new Blob([out])), { title: 'x' }) : null;
+    const out2 = again && again.ok ? await bytesOf(again) : new Uint8Array(0);
+    check(`K2 valid udta sibling (${label}): second write byte-identical`,
+      !!(again && again.ok) && sameBytes(out, out2), `ok=${again && again.ok} ${out2.length} vs ${out.length}`);
+  }
+
+  // ---- 3) the mdat shift is aligned on the *net* change ----
+  {
+    const CHUNKS = 8, CHUNK = 8;
+    const payload = cat(Array.from({ length: CHUNKS }, (_, i) => F.CHUNK_MARK(i)));
+    const stco = (offs) => full('stco', u32b(offs.length), cat(offs.map(u32b)));
+    const stsd = () => box('stsd', zeros(4), u32b(1), cat(u32b(8 + 78), ascii('avc1'), zeros(78)));
+    for (const pad of [0, 3, 7, 8, 11, 15]) {   // 3/7/11/15 => the replaced udta is not 8-aligned
+      const oldUdta = box('udta', MDIR_META(), box('free', zeros(pad)));
+      const buildMoov = (offs) => box('moov', MVHD(), box('trak', box('mdia',
+        full('mdhd', zeros(4), u32b(1000), u32b(1), zeros(8)), hdlr('vide'),
+        box('minf', box('stbl', stsd(), stco(offs))))), oldUdta);
+      const mdatAt = FTYP().length + buildMoov(new Array(CHUNKS).fill(0)).length;
+      const input = cat(FTYP(), buildMoov(Array.from({ length: CHUNKS }, (_, i) => mdatAt + 8 + i * CHUNK)), box('mdat', payload));
+
+      const res = await writeTags(new BlobSource(new Blob([input])), { title: 'New title' });
+      const out = res.ok ? await bytesOf(res) : new Uint8Array(0);
+      // The invariant is that the *shift* is a multiple of 8: that is what keeps
+      // an aligned mdat aligned. (The fixture's own mdat offset is a property of
+      // its box layout, not of the writer.)
+      const inOff = mdatOffset(input), outOff = res.ok ? mdatOffset(out) : -1;
+      const alignedIn = inOff % 8 === 0;
+      check(`K3 old udta ${oldUdta.length % 8 === 0 ? 'is' : 'is not'} 8-aligned (pad ${pad}): mdat shift is a multiple of 8`,
+        res.ok && (outOff - inOff) % 8 === 0 && (!alignedIn || outOff % 8 === 0),
+        `ok=${res.ok} oldUdta=${oldUdta.length} in=${inOff} out=${outOff} ${res.report.error || ''}`);
+      check('K3 reported delta is a multiple of 8', res.ok && res.report.delta % 8 === 0, `delta=${res.report.delta}`);
+      const offs = collectOffsets(out).stco;
+      const hits = offs.length === CHUNKS && offs.every((o, i) => {
+        const mark = F.CHUNK_MARK(i);
+        for (let j = 0; j < mark.length; j++) if (out[o + j] !== mark[j]) return false;
+        return true;
+      });
+      check('K3 shifted chunk offsets still hit every canary', res.ok && hits, JSON.stringify(offs));
+      const again = res.ok ? await writeTags(new BlobSource(new Blob([out])), { title: 'New title' }) : null;
+      const out2 = again && again.ok ? await bytesOf(again) : new Uint8Array(0);
+      check('K3 second write byte-identical', !!(again && again.ok) && sameBytes(out, out2), `ok=${again && again.ok}`);
+    }
+  }
+
+  // ---- 4) inspect() does not read past the stsd box ----
+  {
+    const moov = box('moov', MVHD(), box('trak', box('mdia',
+      full('mdhd', zeros(4), u32b(1000), u32b(1), zeros(8)), hdlr('vide'),
+      box('minf', box('stbl', box('stsd', zeros(4), u32b(1)), full('stco', u32b(1), u32b(0)))))));
+    const info = await inspect(new BlobSource(new Blob([cat(FTYP(), moov, MDAT())])));
+    check('K4 truncated stsd: codec is null, not the neighbouring box type',
+      !!info.mp4 && info.mp4.codec === null, JSON.stringify(info.mp4).slice(0, 150));
+    check('K4 truncated stsd: no frame size is invented', !!info.mp4 && info.mp4.video === null,
+      JSON.stringify(info.mp4).slice(0, 150));
+  }
+
+  // ---- 5) a hand-rolled {read,size} source works, and streaming is counted ----
+  {
+    const jb = F.buildMp4({ layout: 'tail' }).bytes;
+    const bare = { size: jb.length, read: async (s, e) => jb.subarray(s, e) };
+    const res = await writeTags(bare, { title: 'stream stats' });
+    check('K5 bare {read,size} source: accepted and written', res.ok && !!res.stream, res.report && res.report.error);
+    const before = res.report.stats.readCalls;
+    const planBefore = res.report.planning && res.report.planning.bytesRead;
+    let n = 0;
+    for await (const chunk of res.stream) n += chunk.length;
+    check('K5 stream: reads during consumption are counted in report.stats',
+      n > 0 && res.report.stats.readCalls > before, `${before} -> ${res.report.stats ? res.report.stats.readCalls : '?'} (${n} bytes)`);
+    // stats is live (grows with the output stream) but planning is pinned, so the
+    // "reads only the header + moov" claim stays checkable after a full drain.
+    check('K5 stream: report.planning stays pinned at plan time',
+      res.report.planning && res.report.planning.readCalls === before
+        && planBefore === res.report.planning.bytesRead
+        && res.report.planning.bytesRead < res.report.stats.bytesRead,
+      `planning=${JSON.stringify(res.report.planning)} stats.bytesRead=${res.report.stats.bytesRead}`);
+  }
+}
+
+/* ===================================================================== */
 console.log(`\n\x1b[1m${FAIL === 0 ? '\x1b[32mALL PASSED' : '\x1b[31mSOME FAILED'}\x1b[0m  ${PASS} passed, ${FAIL} failed\n`);
 process.exit(FAIL === 0 ? 0 : 1);

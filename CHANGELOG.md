@@ -104,8 +104,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: the independent suite runs in the `interop` job, and a new check fails
   the build when `dist/stamp.umd.js` is stale relative to `src/`.
 - `npm run test:real` and `npm run test:verify` scripts.
+- **46 regression assertions** (`test/run.mjs`, section "K. Review fixes") that
+  pin every fix below: source failures return a report instead of throwing, a
+  malformed udta chain is refused, udta siblings survive a merge, the mdat shift
+  is a multiple of 8, streamed reads reach `report.stats`, a truncated `stsd`
+  reports no codec, and a hand-rolled `{read, size}` source works.
 
 ### Fixed
+- **`writeTags()` / `inspect()` could throw instead of reporting a failure.**
+  The documented "pass a URL string" usage — `writeTags('https://…', tags)`,
+  followed by `if (result.ok)`, exactly as the README shows — resolved the source
+  *before* entering the `try` block, and opening a URL performs a real request.
+  An unreachable host, a DNS/TLS failure or a malformed `Content-Range` therefore
+  escaped as a rejected promise, breaking the "never throws, always returns a
+  report" contract callers rely on. Source resolution is now inside the guarded
+  region, `inspect()` grew an outer `try`, and such failures carry stable codes
+  (`SOURCE_UNREACHABLE`, `UNSUPPORTED_SOURCE`, `SOURCE_NOT_READY`) instead of a
+  bare `TypeError`. The library's own codes (`RANGE_UNSUPPORTED`,
+  `RANGE_MISMATCH`) are passed through unchanged.
+- **A `udta` with a malformed child chain was rewritten anyway, dropping bytes.**
+  `replaceUdtaMeta()` took `listChildrenEx().children` and discarded the
+  `.malformed` flag, while `parseExistingIlst()` located `meta` with `findChild()`
+  without checking that the udta tiled its own range. A file with a corrupted
+  sibling box after `meta` came back `ok: true` with every byte after the bad box
+  silently gone — the exact failure `listChildrenEx()` exists to prevent. Every
+  udta that is going to be rewritten is now validated up front and refused with
+  `MALFORMED_CONTAINER`, on both the in-place and the merged path.
+- **Non-`meta` children of a rewritten `udta` were dropped on the merge path.**
+  Vendor boxes and QuickTime `©tag` atoms sitting beside `meta` survived an
+  in-place update but vanished when several containers were merged into one
+  appended udta. They are now carried over verbatim; `free` is excluded because
+  it is pure padding and carrying it would make repeated writes grow the file.
+- **The mdat shift was not necessarily 8-byte aligned.** `wrapUdta()` padded the
+  *new* udta to a multiple of 8, which guarantees nothing when the udta boxes it
+  replaces were not themselves aligned (`Δ = new − Σremoved`), nor when a
+  `moov/meta` box is rewritten in place and changes length. Measured on a fixture
+  holding a 105-byte old udta, a 31-byte Δ pushed an 8-aligned mdat to offset 466.
+  Alignment is now applied once, to the net change of the whole moov.
+- **Streamed output was invisible to `report.stats`.** `partsToStream()` read
+  through `src.read()`, bypassing the counters, and `writeTags()` snapshotted
+  `stats` *before* the lazy stream was consumed — so ~33 KB of streamed reads
+  showed up as 0 extra bytes. The stream path now uses `_read()`, and
+  `report.stats` is a live view of the source counters. It still reads as a plain
+  object; assigning to it pins an explicit snapshot, which is what the Blob and
+  error paths do. Because a live view necessarily keeps growing while the output
+  stream is consumed (piping to disk reads the whole file), a new
+  `report.planning` object carries the same counters **pinned when the plan
+  finished**, so the headline "reads only the header + moov" number stays
+  measurable after the caller has drained the stream.
+- **`inspect()` could report a codec read from a neighbouring box.** `findStsd()`
+  read the sample entry at fixed offsets (`+4` format, `+32/+34` dimensions)
+  without checking that they fell inside `stsd`. A truncated entry reported
+  `codec: "stco"` — the type of the box that followed it — plus a bogus `0×0`
+  resolution. Out-of-range reads now yield `null` ("unknown") instead of a guess.
+- **A `co64` offset that crossed 2^53 was patched with a rounded value.** `u64()`
+  rejects *stored* offsets ≥ 2^53, but adding Δ could cross that line, and
+  `BigInt(nv)` would then silently encode the already-imprecise `Number`. It is
+  refused with `UNSUPPORTED_LARGESIZE` instead. (Petabyte-scale files only; a
+  guard against writing a wrong offset, not a practical limitation.)
+- **A `{read, size}` source object was accepted and then failed obscurely.**
+  `normalizeSource()` returned it unchanged, so the first planner call died with
+  `src._read is not a function`. Such sources are now wrapped with the
+  bounds-checked, counted `_read()` the rest of the library uses.
 - **A malformed `stco`/`co64` entry count corrupted the neighbouring box.**
   When a chunk-offset table declared more entries than its own box could hold,
   the offset walkers kept reading — and *patching* — the bytes of whatever box
@@ -207,10 +267,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Refusal messages name the container**: AVIF/HEIC (detected via the `ftyp`
   brand, which previously fell through as "moov box not found"), WebP/RIFF and
   WebM/MKV now explain what was detected and why it is not supported yet.
-- **Documented limits made explicit**: README (both languages) now states that
-  JPEG writes XMP only — native EXIF/IFD0 fields such as `ImageDescription` and
-  `Artist` are not populated, so readers that ignore XMP show no title — and
-  spells out the `moov`-proportional memory model with the measured 4.2× factor.
+- **The `moov`-proportional memory model is spelled out** in the README (both
+  languages) with the measured 4.2× factor, so the cost of rewriting a large
+  `moov` is stated up front instead of being discovered in production.
+- **A `udta` that cannot be fully traversed is now refused** instead of being
+  rewritten. A caller that used to receive `ok:true` for such a file now
+  receives `ok:false` with `MALFORMED_CONTAINER` — the previous "success" was
+  silently dropping every byte after the malformed box, so this is a refusal
+  where there used to be quiet data loss.
+- **Source-open failures are reported instead of thrown.** `writeTags()` and
+  `inspect()` never rejected before for unrecognized sources; they now also
+  return a report (`errorCode` `SOURCE_UNREACHABLE` / `UNSUPPORTED_SOURCE` /
+  `SOURCE_NOT_READY`) for a URL that cannot be opened or an `HttpSource` used
+  without `init()`. Callers that wrapped the call in `try/catch` keep working;
+  callers that tested `result.ok` now get the failure they were promised.
 
 ## [0.1.0] - 2025-01-15
 
