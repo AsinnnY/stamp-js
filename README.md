@@ -4,477 +4,307 @@
 [![npm](https://img.shields.io/npm/v/@asinnn/stamp-js.svg)](https://www.npmjs.com/package/@asinnn/stamp-js)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Zero-dependency · Instant writes · Low memory footprint
-Inject metadata into multi-gigabyte media files without loading the media payload.
+> **Zero runtime dependencies · Container-level metadata surgery · Ultra-low memory footprint**
+>
+> Write **XMP / EXIF / iTunes (`mdir`) / QuickTime (`mdta`)** metadata and timestamps into multi-gigabyte **JPEG, PNG, MP4, and MOV** files in browsers, Node.js, Web Workers, or Tampermonkey userscripts — **without decoding media, without re-encoding, without re-muxing, and without reading the media payload into JavaScript memory.**
 
-**stamp-js** is a low-memory metadata writer for **JPEG, PNG, MP4 and MOV**.
-
-It performs container-level metadata surgery without decoding media, without re-encoding, and without reading the media payload into a JavaScript buffer.
-
-**The core idea is simple:** read only the bytes needed to understand and rewrite metadata, then assemble the result from the new bytes plus slices of the original file.
-
-**English | [简体中文](README.zh-CN.md)**
+**English | [简体中文 (详细中文文档)](README.zh-CN.md)**
 
 ---
 
-## 8 GiB MP4 → about 66 KiB read
+## Table of Contents
 
-That is the number worth remembering.
-
-For a large MP4, stamp-js can locate and rewrite metadata while leaving the actual media payload untouched. In the project's large-file verification, an 8 GiB MP4 was tagged after reading about **66 KiB** of input — roughly **0.00077%** of the file size.
-
-| | Whole-file processing | stamp-js |
-|---|---:|---:|
-| Input: 8 GiB MP4 | reads the entire media | **~66 KiB read** |
-| Media payload | parsed / copied | **untouched** |
-| Re-encoding | may be part of the workflow | **never** |
-| Re-muxing | common in media pipelines | **not required** |
-| Unknown codec bytes | may pass through a media stack | **never parsed** |
-
-> **Important:** “low memory” does not mean constant memory for every possible file. For MP4, memory is primarily determined by the size and complexity of the `moov` metadata structure, not by the size of the `mdat` media payload.
+1. [Why stamp-js?](#1-why-stamp-js)
+2. [Key Features](#2-key-features)
+3. [Core Capabilities & How It Works](#3-core-capabilities--how-it-works)
+4. [Supported Metadata Fields Reference (18 Fields + 5 Aliases)](#4-supported-metadata-fields-reference-18-fields--5-aliases)
+5. [Special Field Formats & Validation Rules](#5-special-field-formats--validation-rules)
+6. [Step-by-Step Usage Tutorials](#6-step-by-step-usage-tutorials)
+   - [6.1 Installation & Importing Across Environments](#61-installation--importing-across-environments)
+   - [6.2 Browser File / Blob Tagging & Download](#62-browser-file--blob-tagging--download)
+   - [6.3 Writing MP4/MOV Encoded Date & Tagged Date](#63-writing-mp4mov-encoded-date--tagged-date)
+   - [6.4 Inspecting Media Files & Reading Existing Tags (`inspect()`)](#64-inspecting-media-files--reading-existing-tags-inspect)
+   - [6.5 Preserving & Merging Existing Metadata (`mergeXmp` & `existingTags`)](#65-preserving--merging-existing-metadata-mergexmp--existingtags)
+   - [6.6 Node.js Local Files & `>4 GiB` Large Video Streaming (`NodeFileSource`)](#66-nodejs-local-files--4-gib-large-video-streaming-nodefilesource)
+   - [6.7 HTTP Range Remote Video/Image Streaming](#67-http-range-remote-videoimage-streaming)
+   - [6.8 Custom Data Sources & Plan-Only Mode (`materialize: false`)](#68-custom-data-sources--plan-only-mode-materialize-false)
+   - [6.9 Error Handling & Machine-Readable `errorCode` Reference](#69-error-handling--machine-readable-errorcode-reference)
+7. [Complete API Reference](#7-complete-api-reference)
+8. [Memory Model & Safety Boundaries](#8-memory-model--safety-boundaries)
+9. [Verification & Test Suite](#9-verification--test-suite)
 
 ---
 
-## Why is this different?
+## 1. Why stamp-js?
 
-A conventional browser-side file transformation often looks like this:
+### 8 GiB MP4 → ~66 KiB read
 
-```text
-Input file
-   ↓
-read the whole file
-   ↓
-ArrayBuffer / Uint8Array
-   ↓
-modify
-   ↓
-create another large buffer
-   ↓
-output
-```
+Conventional browser or Node.js metadata workflows often load the entire file into an `ArrayBuffer` or invoke a heavy WebAssembly media pipeline to demux and remux the streams. On multi-hundred-megabyte or multi-gigabyte 4K videos, that turns a tiny metadata edit into an out-of-memory crash or a slow full-disk copy.
 
-For a multi-gigabyte video, that can turn a small metadata change into a large memory problem.
+**stamp-js uses random-access container surgery + reference-slice assembly:**
 
-stamp-js takes a different path:
+| Metric | Whole-file / re-muxing tools | **stamp-js** |
+|---|---|---|
+| **Bytes read on an 8 GiB MP4** | Reads all 8 GiB of media | **~66 KiB read (~0.00077% of file)** |
+| **Media payload (`mdat` / `IDAT` / scan)** | Parsed, copied, or remuxed | **100% untouched (reference slices)** |
+| **Re-encoding** | May occur in transcode pipelines | **Never (100% lossless)** |
+| **Re-muxing** | Demuxes and rebuilds sample tables | **Never (in-place box surgery)** |
+| **Dependencies & bundle size** | Multi-MB WASM or native binaries | **Zero dependencies, pure JS** |
 
 ```text
-                       random-access reads
-                              ↓
-Input file ───────► container metadata
-                              │
-                              ▼
-                       modify only what
-                           must change
-                              │
-                ┌─────────────┴─────────────┐
-                ▼                           ▼
-          new metadata                 original slices
-                │                           │
-                └─────────────┬─────────────┘
-                              ▼
-                            output
+                        random-access header/moov reads
+                                      ↓
+Input Media File ───────► Container probe & safety check
+                                      │
+                                      ▼
+                         Rewrite only metadata bytes
+                         & rebase affected offset tables
+                                      │
+                        ┌─────────────┴─────────────┐
+                        ▼                           ▼
+                  New metadata                Original media slices
+                  (Uint8Array)                (Blob.slice / stream ranges)
+                        │                           │
+                        └─────────────┬─────────────┘
+                                      ▼
+                        Zero-copy output (Blob / Stream)
 ```
 
-The important part is what **does not** happen:
-
-```text
-✗ No full-file ArrayBuffer for Blob/File sources
-✗ No media decoding
-✗ No media payload parsing
-✗ No re-encoding
-✗ No re-muxing
-✗ No silent dropping of unsupported requested tags
-```
-
-Technically, this is **random-access metadata surgery + reference-slice assembly + streaming output**. It is not a transform-stream pipeline of the form `input stream → transform every byte → output stream`.
-
-For a local `Blob`/`File`, the output can be represented as:
+For a local `File` or `Blob`, the resulting file is assembled by reference:
 
 ```js
 new Blob([
-  original.slice(0, editStart),
-  newBytes,
-  original.slice(editEnd),
+  originalFile.slice(0, editStart),
+  newMetadataBytes,
+  originalFile.slice(editEnd, originalFile.size),
 ]);
 ```
 
-Only sources that cannot be sliced locally — such as HTTP Range sources and `NodeFileSource` — are emitted as a `ReadableStream` that reads the original file lazily.
+---
+
+## 2. Key Features
+
+* **Unified 18-Field Metadata Model**: One consistent `tags` object works across **JPEG, PNG, MP4, and MOV**, supporting `title`, `artist`, `date`, `encodedDate`, `taggedDate`, `dateOriginal`, `description`, `comment`, `url`, `software`, `copyright`, `keywords`, `album`, `genre`, `make`, `model`, `gps`, and `rating`.
+* **Dual-Track Metadata Writing (XMP + Native EXIF/iTXt/Boxes)**:
+  * **JPEG**: Writes standard **W3C XMP (`APP1`)** plus **native EXIF (`IFD0` / `ExifIFD` / `GPSIFD`)** so OS property sheets (Windows Explorer, macOS Finder), photo managers, and ExifTool all read the tags.
+  * **PNG**: Writes **XMP (`iTXt`)**, **14 standard `iTXt` text chunks**, and a **native `eXIf` chunk**, with full CRC32 calculation.
+  * **MP4 / MOV**: Writes both **`ilst` metadata atoms** (automatically preserving existing Apple iTunes `mdir` or QuickTime `mdta` `keys` styles) and **`mvhd` / `tkhd` / `mdhd` header timestamps** (32-bit v0 and 64-bit v1).
+* **Read Existing Metadata (`inspect().existingTags`) & Smart Merge (`mergeXmp: true`)**: `inspect()` parses existing XMP, EXIF, PNG `iTXt`, and MP4 `ilst`/`mvhd` metadata into `info.existingTags`. Pass `{ mergeXmp: true }` to `writeTags()` to automatically merge new fields with existing JPEG/PNG XMP fields.
+* **Automatic `stco → co64` 64-bit Upgrade & 8-Byte Alignment Solver**: When tagging a `faststart` MP4 near or above 4 GiB pushes 32-bit chunk offsets (`stco`) past `0xFFFFFFFF`, stamp-js upgrades overflowing tracks to 64-bit `co64` and solves for metadata growth, `co64` growth, and `free` box padding in a single monotonic fixed-point loop (`planAlignedMoovGrowth`), maintaining the project's 8-byte shift alignment invariant.
+* **Motion Photo (MPF CIPA DC-007) Offset Rebasing**: Automatically updates absolute image lengths and secondary video/image offsets in `APP2 MPF` when JPEG header sizes change.
+* **Safety by Refusal**: Never throws uncaught exceptions, never silently drops unsupported tags, and refuses fragmented MP4s (fMP4/CMAF) or malformed containers with machine-readable `errorCode`s.
+* **Strict Idempotency**: Writing the same tags twice produces byte-for-byte identical output without stacking duplicate XMP segments or `udta` boxes.
 
 ---
 
-## The mechanism: random access + container surgery
+## 3. Core Capabilities & How It Works
 
-The browser already exposes the primitive this design needs:
+### 3.1 JPEG: Header-Only Scan + Append-Only EXIF + Motion Photo MPF
+
+1. **Header-only scan**: Scans markers from `SOI (0xFFD8)` up to the first image coding marker (`DQT` / `SOF` / `DHT` / `SOS`), starting with a 64 KiB window (expanding up to an 8 MiB hard cap for vendor deep-data headers) and never reading entropy-coded scan data.
+2. **XMP & stale Extended XMP cleanup**: Replaces existing standard XMP `APP1` segments and drops orphaned `http://ns.adobe.com/xmp/extension/` fragments.
+3. **Append-only native EXIF surgery**: Because all offsets inside a TIFF block are relative to the TIFF header, updated `IFD0`, `ExifIFD`, and `GPSIFD` tables are appended at the end of the existing TIFF block and only the 4-byte `IFD0` pointer in the TIFF header is updated. Existing camera `MakerNotes` and `IFD1` thumbnails keep both their exact bytes and their exact offsets.
+
+### 3.2 PNG: Zero IDAT Reads + Triple Metadata Layers
+
+1. **Never reads `IDAT` bodies**: Walks chunk headers (`length` + `type`) from `IHDR` to the first `IDAT` chunk and inserts metadata before `IDAT`, even if `IDAT` is hundreds of megabytes.
+2. **Triple layer**: Writes `XML:com.adobe.xmp` (`iTXt`), standard `iTXt` keywords (`Title`, `Author`, `Creation Time`, `Encoded Time`, `Modify Time`, `Collection`, `Genre`, `Source`, `Location`, `Rating`, etc.), and native `eXIf`.
+
+### 3.3 MP4 / MOV: Box-Level Surgery + Offset Rebasing + Header Timestamps
+
+1. **Layout-aware planning**:
+   * **`moov` at tail**: Appends/updates metadata at the end of the file with zero sample offset changes (`moov-at-tail-zero-offset`).
+   * **`moov` at head (`faststart`)**: Rewrites `moov` and shifts all `stco` / `co64` chunk offsets after `moov` by the exact `moov` size delta (`moov-at-head-shift-offsets`).
+2. **`mdir` and `mdta` dual handler support**: Preserves existing non-conflicting entries, rebases `mdta` numeric key indices when merging multiple `udta` boxes, retains `----` freeform atoms, and updates mixed `mdir` + `mdta` containers in place in their respective formats.
+3. **Header timestamp patching (`encodedDate` & `taggedDate`)**: Converts dates to QuickTime/MP4 epoch seconds (since `1904-01-01T00:00:00Z`) and patches `creation_time` and `modification_time` in `mvhd`, `tkhd`, and `mdhd` (both v0 32-bit and v1 64-bit).
+
+---
+
+## 4. Supported Metadata Fields Reference (18 Fields + 5 Aliases)
+
+All **18 standard fields** are supported across **JPEG, PNG, and MP4/MOV**:
+
+| Field | Aliases | Type | Description | JPEG Target (XMP + EXIF) | PNG Target (XMP + iTXt + eXIf) | MP4 / MOV Target (`mdir` / `mdta` / Header) |
+|---|---|---|---|---|---|---|
+| **`title`** | — | `string` | Title / work name | `dc:title` + `IFD0 0x010E` | `dc:title` + `iTXt["Title"]` + `eXIf 0x010E` | `©nam` / `keys["title"]` |
+| **`artist`** | — | `string` | Author / creator / artist | `dc:creator` + `IFD0 0x013B` | `dc:creator` + `iTXt["Author"]` + `eXIf 0x013B` | `©ART` / `keys["artist"]` |
+| **`date`** | — | `string \| Date \| number` | Creation date | `xmp:CreateDate` + `IFD0 0x0132` | `xmp:CreateDate` + `iTXt["Creation Time"]` | `©day` / `keys["date"]` + syncs `mvhd/tkhd/mdhd` |
+| **`encodedDate`** | `creationTime` | `string \| Date \| number` | **Encoded / digitized date** (`Encoded date` in MediaInfo) | `exif:DateTimeDigitized` + `xmp:CreateDate` + `ExifIFD 0x9004` | `exif:DateTimeDigitized` + `iTXt["Encoded Time"]` + `eXIf 0x9004` | **`mvhd` / `tkhd` / `mdhd` `creation_time`** (v0 32-bit & v1 64-bit) |
+| **`taggedDate`** | `modificationTime`, `modifyDate` | `string \| Date \| number` | **Tagged / modification date** (`Tagged date` in MediaInfo) | `xmp:ModifyDate` + `xmp:MetadataDate` + `IFD0 0x0132` | `xmp:ModifyDate` + `xmp:MetadataDate` + `iTXt["Modify Time"]` | **`mvhd` / `tkhd` / `mdhd` `modification_time`** (v0 32-bit & v1 64-bit) |
+| **`dateOriginal`** | `captureDate` | `string \| Date \| number` | **Original capture date** | `exif:DateTimeOriginal` + `ExifIFD 0x9003` | `exif:DateTimeOriginal` + `eXIf 0x9003` | `©day` / `keys["com.apple.quicktime.creationdate"]` |
+| **`description`** | — | `string` | Detailed description / caption | `dc:description` + `IFD0 0x010E` | `dc:description` + `iTXt["Description"]` + `eXIf 0x010E` | `desc` / `keys["description"]` |
+| **`comment`** | — | `string` | User comment / notes | `dc:description` + `ExifIFD 0x9286 (UserComment)` (when empty) | `dc:description` + `iTXt["Comment"]` + `eXIf 0x9286` | `©cmt` / `keys["comment"]` |
+| **`url`** | — | `string` | Source URL / link | `dc:source` + appended to `dc:description` | `dc:source` + appended to `iTXt["Description"]` | `©url` / `keys["url"]` + appended to comment |
+| **`software`** | — | `string` | Creator tool / software | `xmp:CreatorTool` (leaves `0x0131` camera firmware intact) | `xmp:CreatorTool` + `iTXt["Software"]` | `©too` / `keys["software"]` |
+| **`copyright`** | — | `string` | Copyright notice | `dc:rights` + `IFD0 0x8298` | `dc:rights` + `iTXt["Copyright"]` + `eXIf 0x8298` | `cprt` / `keys["copyright"]` |
+| **`keywords`** | — | `string[] \| string` | Keywords / subject tags | `dc:subject` (`<rdf:Bag><rdf:li>...`) | `dc:subject` (`<rdf:Bag><rdf:li>...`) | `©key` / `keys["keywords"]` (comma-joined) |
+| **`album`** | — | `string` | Album / collection | `xmpDM:album` | `xmpDM:album` + `iTXt["Collection"]` | `©alb` / `keys["album"]` |
+| **`genre`** | — | `string` | Genre / category | `xmpDM:genre` | `xmpDM:genre` + `iTXt["Genre"]` | `©gen` / `keys["genre"]` |
+| **`make`** | — | `string` | Camera / device manufacturer | `tiff:Make` + `IFD0 0x010F` | `tiff:Make` + `iTXt["Source"]` + `eXIf 0x010F` | `©mak` / `keys["com.apple.quicktime.make"]` |
+| **`model`** | — | `string` | Camera / device model | `tiff:Model` + `IFD0 0x0110` | `tiff:Model` + `iTXt["Source"]` + `eXIf 0x0110` | `©mod` / `keys["com.apple.quicktime.model"]` |
+| **`gps`** | `location` | `GpsObject \| string` | GPS coordinates (lat, lon, optional alt) | `exif:GPS*` + `GPSIFD (0x0000..0x0006)` | `exif:GPS*` + `iTXt["Location"]` + `eXIf GPSIFD` | `©xyz` / `keys["com.apple.quicktime.location.ISO6709"]` |
+| **`rating`** | — | `number` | Star rating (`-1` rejected, `0..5` stars) | `xmp:Rating` + `IFD0 0x4746` | `xmp:Rating` + `iTXt["Rating"]` + `eXIf 0x4746` | `rate` / `keys["com.apple.quicktime.rating.user"]` |
+
+---
+
+## 5. Special Field Formats & Validation Rules
+
+All date, GPS, and rating inputs are validated uniformly by `validateTags()` before dispatching to any format planner.
+
+### 5.1 Date Fields (`date`, `encodedDate`, `taggedDate`, `dateOriginal`)
+
+**Accepted formats**:
+1. **ISO-8601 date-time or date-only string**: `'2026-04-02T09:30:00Z'`, `'2026-04-02T17:30:00+08:00'`, `'2026-04-02 09:30:00'`, `'2026-04-02'`
+2. **EXIF date string**: `'2026:04:02 09:30:00'` or `'2026:04:02'`
+3. **MediaInfo UTC string**: `'UTC 2026-04-02 09:30:00'`
+4. **Valid `Date` instance**: `new Date('2026-04-02T09:30:00Z')` (`!Number.isNaN(d.getTime())`)
+5. **Non-negative finite number**: Unix epoch milliseconds (`1775122200000`) or seconds (`1775122200`)
+
+**Rejected inputs (`ok: false`, `report.errorCode === 'BAD_OPTION'`)**:
+* `new Date(NaN)` or `new Date('invalid')`
+* `NaN`, `Infinity`, or negative numbers
+* Unparseable strings (`'INVALID_DATE'`, `'not-a-date'`)
+* Impossible calendar dates (`'2026-02-30T10:00:00Z'`, non-leap `'2026-02-29'`, month `13`)
+
+### 5.2 GPS Coordinates (`gps` or `location`)
 
 ```js
-file.slice(start, end)
-```
+// 1. Short object keys
+gps: { lat: 31.2304, lon: 121.4737, alt: 12.5 }
 
-stamp-js builds a source abstraction around that primitive and asks only for specific ranges.
+// 2. Full object keys
+gps: { latitude: 31.2304, longitude: 121.4737, altitude: 12.5 }
 
-An MP4/ISO-BMFF file is a hierarchy of boxes:
+// 3. ISO-6709 string
+gps: '+31.2304+121.4737+12.50/'
 
-```text
-┌──────────┬──────────┬─────────────────────┐
-│ size     │ type     │ payload             │
-├──────────┼──────────┼─────────────────────┤
-│ 4/8+ B   │ 4 bytes  │ size - header bytes  │
-└──────────┴──────────┴─────────────────────┘
-```
-
-Conceptually, an MP4 may be arranged as:
-
-```text
-[ ftyp ][ moov ][ mdat........................................ ]
-```
-
-or:
-
-```text
-[ ftyp ][ mdat........................................ ][ moov ]
-```
-
-stamp-js does not need to read `mdat` simply because `mdat` may be enormous. It locates the relevant container structures, reads the `moov` when required, rewrites metadata there, patches offsets when layout changes require it, and preserves the media bytes as original slices.
-
-The same principle is used for JPEG and PNG header structures: the library finds the metadata insertion/replacement point without reading image payload data such as JPEG scan data or PNG `IDAT` bodies.
-
----
-
-## What it writes
-
-| Container | Metadata written | Status |
-|---|---|---|
-| JPEG | XMP + native EXIF IFD0 | ✅ |
-| PNG | XMP + iTXt + native `eXIf` | ✅ |
-| MP4 / MOV | iTunes / QuickTime (`mdir`) + `mdta` metadata | ✅ |
-
-### Supported fields
-
-| Field | JPEG | PNG | MP4 / MOV |
-|---|---|---|---|
-| `title` | ✅ | ✅ | ✅ |
-| `artist` | ✅ | ✅ | ✅ |
-| `date` | ✅ | ✅ | ✅ |
-| `comment` | ✅ | ✅ | ✅ |
-| `url` | ✅ | ✅ | ✅ |
-| `software` | ✅ | ✅ | ✅ |
-| `copyright` | ✅ | ✅ | ✅ |
-| `keywords` | ✅ | ✅ | ❌ refused |
-
-`keywords` is deliberately refused for MP4/MOV because this library does not claim a standard MP4 location for that field. A requested field that the target container cannot store is reported as an error instead of being silently discarded.
-
----
-
-## Native EXIF, not just XMP
-
-For JPEG, XMP alone is not enough for every consumer. Some operating-system property sheets and software prefer native TIFF/EXIF fields.
-
-stamp-js therefore mirrors selected fields into JPEG EXIF IFD0:
-
-```text
-ImageDescription  0x010E  ← title
-Artist            0x013B  ← artist
-Copyright         0x8298  ← copyright
-DateTime          0x0132  ← date
-```
-
-The EXIF implementation is deliberately conservative. The existing EXIF block is not blindly parsed and serialized back from scratch. The rewritten IFD0 is placed at the end of the TIFF block and the TIFF header's IFD0 pointer is updated, while other regions such as GPS, ExifIFD, IFD1/thumbnail and vendor MakerNotes remain in place.
-
-`UserComment` is only filled when appropriate and is not blindly overwritten, because vendors may store processing information there.
-
-PNG uses the same TIFF machinery inside an `eXIf` chunk. The PNG date is kept in its canonical `Creation Time` text location rather than mirrored into EXIF by default.
-
-You can opt out of native EXIF mirroring with:
-
-```js
-{ nativeExif: false }
-```
-
-XMP is still written.
-
----
-
-## MP4 / MOV: metadata surgery, not video processing
-
-The MP4/MOV planner works at the ISO-BMFF box level.
-
-It can handle metadata stored in layouts including:
-
-```text
-moov/udta/meta/ilst
-moov/meta/ilst
-```
-
-It understands both common metadata handler styles:
-
-```text
-mdir  → QuickTime / iTunes-style named atoms
-mdta  → keys table + indexed entries
-```
-
-With `metadataFormat: 'auto'`, each existing metadata container follows its own existing handler format where applicable.
-
-### Existing metadata is merged carefully
-
-Multiple `moov/udta/meta` containers can be merged into one updated metadata container. A `mdir` container and an `mdta` container are **not** blindly merged with each other, because their `ilst` semantics are different.
-
-When no supported metadata container exists, stamp-js creates one.
-
----
-
-## Offset rebasing and 64-bit offsets
-
-Changing a `moov` located before `mdat` may change the absolute position of media samples.
-
-For example:
-
-```text
-before:
-[ moov ][ mdat................ ]
-        ↑
-      sample offsets
-
-            + Δ metadata bytes
-
-after:
-[ new moov ][ mdat................ ]
-            ↑
-      sample offsets moved
-```
-
-The MP4 planner therefore rebases absolute chunk offsets in `stco` and `co64` when the fast-start layout requires it.
-
-If a 32-bit `stco` offset would overflow after rebasing, the planner can upgrade that specific table to `co64`.
-
-The upgrade itself changes the size of `moov`, which changes the offset delta again. stamp-js resolves this with a bounded monotonic fixed-point iteration before rebuilding the final `moov`.
-
-This is entirely a metadata-side operation: the `mdat` payload does not need to be opened or rewritten.
-
-### What “64-bit support” means here
-
-The implementation supports:
-
-- 64-bit chunk offsets in `co64`;
-- a 64-bit `largesize` `mdat`;
-- correct handling of files larger than 4 GiB when the appropriate source reports the true 64-bit size.
-
-For safety, a `moov` itself using a `largesize` header — or a `largesize` box inside the metadata tree — is refused rather than rewritten.
-
----
-
-## Memory model
-
-The most important promise is **not** “memory is always constant”. The more precise property is:
-
-> **Memory is decoupled from the size of the media payload.**
-
-For MP4, the main in-memory object is `moov`.
-
-The project's measurements show a peak heap delta converging around 4.2× the `moov` size during rewrite because the original `moov`, rebuilt `moov`, and supporting box tables may coexist.
-
-| `moov` | File | Measured peak extra heap |
-|---:|---:|---:|
-| 0.08 MB | 0.4 MB | 0.62 MB |
-| 0.38 MB | 1.9 MB | 2.15 MB |
-| 1.53 MB | 7.6 MB | 6.53 MB |
-| 3.82 MB | 19 MB | 16.0 MB |
-
-The important observation is that the media payload can be hundreds of megabytes or several gigabytes without becoming the dominant JavaScript allocation.
-
-A warning is emitted above the configured `moov` warning threshold (16 MiB). You can inspect the file first and make an application-level decision before rewriting.
-
-```js
-const info = await inspect(file);
-console.log(info.mp4?.moovSize);
+// 4. Comma-separated string
+gps: '31.2304, 121.4737, 12.5'
 ```
 
 ---
 
-## JPEG and PNG read only their headers
+## 6. Step-by-Step Usage Tutorials
 
-### JPEG
-
-The planner scans JPEG markers until the insertion point before the image data. Existing XMP and stale Extended XMP fragments are replaced/removed as part of an idempotent write.
-
-Motion-photo / Multi-Picture Format (MPF) indexes are also handled. If header sizes move, MPF offsets and lengths are rebased through the same position map used for other absolute file references. An unparseable or overflowing MPF index is refused.
-
-The JPEG header scan starts at 64 KiB and can grow up to an 8 MiB cap. A file whose insertion point is beyond that limit is refused rather than forcing a full-file scan.
-
-### PNG
-
-The planner walks chunks from `IHDR` toward `IDAT` / `IEND` and inserts metadata before the image payload.
-
-The `IDAT` body is never read. A chunk header is enough to find the insertion boundary, even when the image data is enormous.
-
-Existing owned XMP/text chunks are replaced without touching the image data.
-
----
-
-## Safety by refusal
-
-A metadata editor should fail safely when it does not understand the structure it needs to modify.
-
-stamp-js follows this rule:
-
-```text
-Can rewrite safely
-       ↓
-      write
-
-Cannot prove the rewrite is safe
-       ↓
-     refuse
-       ↓
- return a machine-readable reason
-```
-
-Examples of refused inputs include:
-
-- fragmented MP4 / CMAF;
-- corrupt or truncated containers;
-- malformed metadata trees that cannot be fully traversed;
-- unsupported containers;
-- MP4/MOV `keywords`;
-- metadata larger than the supported 64 KiB single-segment limit;
-- unparseable JPEG MPF indexes;
-- HTTP sources without Range support;
-- HTTP responses that do not match the requested byte range;
-- empty tag objects;
-- `moov` boxes using unsupported `largesize` headers;
-- `largesize` boxes inside metadata trees that the planner cannot safely rewrite.
-
-The API returns `ok: false` and keeps the failure reason in `report.error` / `report.errorCode` instead of returning a misleading success value.
-
-Source failures follow the same rule — `writeTags()` and `inspect()` never throw. Passing a URL directly is documented usage, so a URL that cannot be opened (DNS failure, connection refused, TLS error) comes back as `ok: false` with `report.errorCode === 'SOURCE_UNREACHABLE'`; a source of an unrecognized type as `'UNSUPPORTED_SOURCE'`; and an `HttpSource` instance that was never `init()`ed as `'SOURCE_NOT_READY'`, with a message naming the missing call. A server that answers but cannot serve byte ranges keeps `'RANGE_UNSUPPORTED'`.
-
----
-
-## XMP is replaced wholesale
-
-For JPEG and PNG the XMP packet is **rebuilt in full on every write**, not merged
-field by field. Fields you do not pass are written as empty elements, so
-
-```js
-await writeTags(jpeg, { artist: 'X' });
-```
-
-clears any pre-existing `title`, `description` and `keywords` in the XMP packet.
-This keeps writes idempotent and the packet self-consistent, but it means you
-must pass every field you want to keep:
-
-```js
-await writeTags(jpeg, { title: oldTitle, description: oldDescription, artist: 'X' });
-```
-
-An entirely empty tag object is refused rather than treated as "wipe everything".
-`inspect()` reports the fields that are currently present, which is the intended
-way to read them first if you need to round-trip a file.
-
-(MP4/MOV behaves differently: existing `ilst` entries that you did not ask to
-change are preserved, because they live in a keyed table rather than in one
-replaced packet.)
-
----
-
-## Idempotent writes
-
-Writing the same tags repeatedly is designed to be stable:
-
-```text
-write(tags)
-    ↓
-write(tags)
-    ↓
-no duplicate metadata
-no endlessly growing headers
-same resulting bytes when the operation is already satisfied
-```
-
-Same-name fields are replaced rather than appended as duplicates.
-
----
-
-## Byte preservation
-
-stamp-js is intentionally conservative about bytes it does not own.
-
-The verification suite checks properties including:
-
-```text
-metadata changed        ✅
-media payload changed   ❌
-unknown boxes changed   ❌ where they are outside the planned edits
-output structurally sane ✅
-second write            stable / idempotent
-```
-
-For MP4, the `mdat` payload is kept as original slices. For images, payload data is not decoded or reconstructed as part of the metadata write.
-
----
-
-## A small API
-
-### Install
+### 6.1 Installation & Importing Across Environments
 
 ```bash
 npm install @asinnn/stamp-js
 ```
 
-### Browser / Blob / File
+```js
+// ESM (Browser bundlers, Node.js 18+, Deno, Bun)
+import { writeTags, inspect, capabilities, BlobSource, BufferSource, HttpSource } from '@asinnn/stamp-js';
+import { NodeFileSource, openFile } from '@asinnn/stamp-js/node';
+```
+
+For `<script>` tags or Tampermonkey userscripts:
+
+```html
+<script src="https://unpkg.com/@asinnn/stamp-js@0.1.2/dist/stamp.umd.js"></script>
+<script>
+  const { writeTags, inspect, capabilities } = window.stamp;
+</script>
+```
+
+---
+
+### 6.2 Browser File / Blob Tagging & Download
 
 ```js
-import { writeTags, BlobSource } from '@asinnn/stamp-js';
+import { writeTags } from '@asinnn/stamp-js';
 
-const result = await writeTags(new BlobSource(file), {
-  title: 'My Video',
-  artist: 'Alice',
-  date: '2026-04-02T09:30:00Z',
-  comment: 'Recorded on device',
-  url: 'https://example.com/item/123',
-  software: 'My App',
-  copyright: '© 2026 Alice',
+const result = await writeTags(file, {
+  title: 'Qinghai Lake Sunset Aerial',
+  artist: 'Asinnn',
+  date: '2026-08-15T18:20:00Z',
+  encodedDate: '2026-08-15T18:20:00Z',
+  taggedDate: new Date(),
+  dateOriginal: '2026-08-15T17:55:10Z',
+  description: '4K HDR time-lapse captured by drone',
+  comment: 'Original ungraded archive',
+  url: 'https://example.com/videos/qinghai-lake',
+  software: 'MyMediaApp/1.0',
+  copyright: '© 2026 Asinnn. All rights reserved.',
+  keywords: ['Qinghai', 'Aerial', 'Sunset', '4K'],
+  album: '2026 Northwest Trip',
+  genre: 'Nature',
+  make: 'DJI',
+  model: 'Mavic 3 Pro',
+  gps: { lat: 36.8869, lon: 100.1408, alt: 3205 },
+  rating: 5,
 });
 
 if (result.ok) {
-  // result.blob for Blob/File sources
-  download(result.blob);
+  const url = URL.createObjectURL(result.blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `tagged_${file.name}`;
+  a.click();
+  URL.revokeObjectURL(url);
 } else {
-  console.warn(result.report.errorCode, result.report.error);
+  console.error(result.report.errorCode, result.report.error);
 }
 ```
 
-### Inspect without writing
+---
+
+### 6.3 Writing MP4/MOV Encoded Date & Tagged Date
+
+```js
+import { writeTags } from '@asinnn/stamp-js';
+
+// Header-only timestamp update (delta === 0, zero file growth, no offset shift):
+const resHeaderOnly = await writeTags(mp4File, {
+  encodedDate: '2026-05-01T10:00:00Z', // or alias: creationTime
+  taggedDate: '2026-05-02T15:30:00Z',  // or alias: modificationTime / modifyDate
+});
+
+if (resHeaderOnly.ok) {
+  console.log(resHeaderOnly.report.mp4Dates);
+  // { encodedDate: '2026-05-01T10:00:00Z', taggedDate: '2026-05-02T15:30:00Z', boxesPatched: 3 }
+}
+```
+
+---
+
+### 6.4 Inspecting Media Files & Reading Existing Tags (`inspect()`)
 
 ```js
 import { inspect } from '@asinnn/stamp-js';
 
 const info = await inspect(file);
 
-console.log(info.format);
-console.log(info.capabilities);
-console.log(info.mp4?.moovSize);
+console.log(info.format);                 // 'jpeg' | 'png' | 'mp4' | 'avif' | 'heic' | 'riff' | 'ebml' | 'unknown'
+console.log(info.safeToWrite);            // true | false
+console.log(info.capabilities.supported); // 18 field names (or [] for unsupported formats)
+console.log(info.existingTags);           // Normalized existing metadata (title, artist, encodedDate, keywords, etc.)
+console.log(info.mp4?.moovSize);          // MP4 moov size in bytes
 ```
 
-### HTTP Range source
+---
 
-A URL source requires a server that correctly supports byte ranges.
+### 6.5 Preserving & Merging Existing Metadata (`mergeXmp` & `existingTags`)
+
+* **MP4 / MOV**: Existing `ilst` tags that you do not overwrite are preserved automatically.
+* **JPEG / PNG**: By default (`mergeXmp: false`), the XMP packet is rebuilt in full from the supplied `tags` object. To update a subset of fields while keeping all existing XMP fields:
 
 ```js
-import { writeTags } from '@asinnn/stamp-js';
+// Option 1: Automatic merge via { mergeXmp: true }
+await writeTags(jpegFile, { artist: 'Updated Artist' }, { mergeXmp: true });
 
-const result = await writeTags('https://example.com/video.mp4', {
-  title: 'Remote video',
-});
-
-if (result.ok) {
-  // URL sources are emitted as a ReadableStream.
-  await streamToYourWriter(result.stream);
+// Option 2: Explicit round-trip via inspect().existingTags
+const info = await inspect(jpegFile);
+if (info.safeToWrite) {
+  await writeTags(jpegFile, { ...info.existingTags, artist: 'Updated Artist' });
 }
 ```
 
-### Node.js files, including >4 GiB
+---
 
-For very large files in Node, use `NodeFileSource` rather than relying on `fs.openAsBlob()` for size reporting.
+### 6.6 Node.js Local Files & `>4 GiB` Large Video Streaming (`NodeFileSource`)
+
+Node 22's `fs.openAsBlob()` truncates file sizes `>= 4 GiB` to 32 bits. Use `NodeFileSource` from `@asinnn/stamp-js/node` for reliable 64-bit file sizes (`fstat`) and lazy streaming output:
 
 ```js
 import fs from 'node:fs';
@@ -483,346 +313,123 @@ import { pipeline } from 'node:stream/promises';
 import { writeTags } from '@asinnn/stamp-js';
 import { NodeFileSource } from '@asinnn/stamp-js/node';
 
-const src = new NodeFileSource('huge.mp4');
+const src = new NodeFileSource('huge-8gb.mp4');
 
 try {
-  const result = await writeTags(src, { title: 'Big file' });
-
-  if (!result.ok) {
-    throw new Error(result.report.error);
-  }
+  const result = await writeTags(src, {
+    title: '8 GiB Master Archive',
+    encodedDate: '2026-10-15T08:00:00Z',
+  });
+  if (!result.ok) throw new Error(result.report.error);
 
   await pipeline(
     Readable.fromWeb(result.stream),
-    fs.createWriteStream('out.mp4'),
+    fs.createWriteStream('huge-8gb-tagged.mp4')
   );
 } finally {
-  // NodeFileSource reads lazily while the output stream is consumed.
   src.close();
 }
 ```
 
-`NodeFileSource` obtains the true file size through `fstat` and serves random-access reads through `fs.read`. It cannot provide local reference slices, so its output is a `ReadableStream`.
-
 ---
 
-## API surface
-
-```ts
-type Tags = {
-  title?: string;
-  artist?: string;
-  date?: string;
-  comment?: string;
-  url?: string;
-  software?: string;
-  copyright?: string;
-  keywords?: string[];
-};
-
-type WriteOptions = {
-  metadataFormat?: 'auto' | 'mdir' | 'mdta';
-  nativeExif?: boolean;
-  materialize?: boolean;
-  chunkSize?: number;
-  mimeType?: string;
-};
-
-writeTags(
-  source: Blob | File | Uint8Array | ArrayBuffer | string | Source,
-  tags: Tags,
-  options?: WriteOptions,
-): Promise<
-  | {
-      ok: true;
-      blob?: Blob;
-      stream?: ReadableStream;
-      parts: Array<unknown>;
-      size: number;
-      report: object;
-    }
-  | {
-      ok: false;
-      report: object;
-    }
->;
-
-inspect(source): Promise<MediaInfo>;
-```
-
-### Useful options
-
-`metadataFormat`
-
-Controls the MP4 metadata handler format. `auto` follows the existing layout where applicable; `mdir` and `mdta` explicitly select a format for newly built metadata.
-
-`nativeExif`
-
-Defaults to enabled. Set `false` to skip the native EXIF mirror while continuing to write XMP.
-
-`materialize`
-
-Set `false` when you want the rewrite plan and parts without immediately materializing a Blob or creating an output stream.
-
-`chunkSize`
-
-Controls the chunk size used by `partsToStream()` for stream-based sources.
-
-`mimeType`
-
-Optional output MIME type for Blob materialization.
-
----
-
-## Reports are measurable
-
-The source layer exposes counters so applications and tests can observe the I/O strategy instead of trusting a marketing claim.
-
-Typical statistics include:
-
-```text
-readCalls
-bytesRead
-maxReadSize
-sliceCalls
-```
-
-The write report also contains structured information about:
-
-```text
-format
-strategy
-outputSize
-edits
-input
-changes
-metadata
-offsets
-warnings
-notes
-stats
-planning
-```
-
-`stats` is a **live view** of the source counters: it reports the reads performed
-so far, so it keeps growing if you go on to consume `result.stream` (piping a
-stream to disk legitimately reads the whole file). `planning` is the same shape,
-pinned at the moment the metadata plan was finished — use it for the "how much
-did the metadata surgery cost?" number:
+### 6.7 HTTP Range Remote Video/Image Streaming
 
 ```js
-planning.bytesRead     // header + metadata reads; does NOT grow with the output
-planning.readCalls
-planning.maxReadSize
-```
+import { writeTags } from '@asinnn/stamp-js';
 
-For example:
+const result = await writeTags('https://cdn.example.com/video.mp4', {
+  title: 'Streamed Remote Video',
+});
 
-```js
 if (result.ok) {
-  console.log({
-    bytesRead: result.report.stats?.bytesRead,
-    reads: result.report.stats?.readCalls,
-    slices: result.report.stats?.sliceCalls,
-    strategy: result.report.strategy,
-    warnings: result.report.warnings,
-  });
+  // result.stream is a standard ReadableStream<Uint8Array>
+  await streamToDestination(result.stream);
 }
 ```
 
-This makes “large-file friendly” behavior measurable in CI and in applications.
+---
+
+### 6.8 Custom Data Sources & Plan-Only Mode (`materialize: false`)
+
+Pass `{ materialize: false }` to inspect the exact byte edit plan (`result.parts`) and planning I/O counters (`result.report.planning`) without constructing a `Blob` or `ReadableStream`:
+
+```js
+const plan = await writeTags(file, { title: 'Plan Only' }, { materialize: false });
+console.log(plan.parts, plan.report.planning);
+```
 
 ---
 
-## Low-level building blocks
+### 6.9 Error Handling & Machine-Readable `errorCode` Reference
 
-The package also exposes the lower-level components used by the main API:
+`writeTags()` and `inspect()` never throw. Refusals return `ok: false` with `report.errorCode`:
 
-```text
-capabilities
-probeMp4
-planJpeg
-planPng
-planMp4
-parseMpf
-rebaseMpf
-partsToStream
-Source
-BlobSource
-BufferSource
-HttpSource
-```
-
-Node adds:
-
-```text
-NodeFileSource
-openFile
-```
-
-This separation is intentional. The high-level API handles common metadata writes, while the planners and source abstractions can also serve applications that need more direct control over container-level editing.
-
----
-
-## Supported environments
-
-| Runtime | Support |
+| `errorCode` | Meaning |
 |---|---|
-| Node.js | 18+ |
-| Chrome / Edge | 67+ |
-| Firefox | 68+ |
-| Safari | 15+ |
-| Deno / Bun | current versions |
-| Web Workers | ✅ |
-| Service Workers | ✅ |
-| Tampermonkey | ✅ via `dist/stamp.umd.js` |
-
-The package ships ESM and UMD builds and has no runtime dependencies.
+| `NO_TAGS` | Empty `{}` tags object, empty strings, or unknown-only keys |
+| `BAD_OPTION` | Invalid `Date` (`new Date(NaN)`), invalid date string (`'2026-02-30'`), invalid `gps` or `rating`, or bad `metadataFormat` |
+| `UNSUPPORTED_FORMAT` | Unsupported container (`AVIF`, `HEIC`, `WebP/RIFF`, `WebM/MKV`, or unknown binary) |
+| `UNSUPPORTED_TAG` | Requested field not supported by the target container |
+| `FRAGMENTED_MP4` | Fragmented MP4 / CMAF (`moof`/`sidx` present) |
+| `MALFORMED_CONTAINER` | Truncated headers, out-of-bounds box sizes, multiple `moov` boxes, or corrupt metadata/offset tables |
+| `UNSUPPORTED_LARGESIZE` | 64-bit `largesize` on `moov` or metadata children, or offset `> 2^53` |
+| `XMP_TOO_LARGE` | XMP packet exceeds JPEG 64 KiB single-segment limit |
+| `MPF_INVALID` | Corrupt or overflowing JPEG `APP2 MPF` motion-photo index |
+| `RANGE_UNSUPPORTED` | HTTP server does not support `206 Partial Content` byte ranges |
+| `RANGE_MISMATCH` | HTTP server returned a `Content-Range` or body length that does not match the request |
+| `SOURCE_UNREACHABLE` | Network/DNS/TLS error opening a URL source |
+| `SOURCE_NOT_READY` | `HttpSource` passed before `await src.init()` |
+| `UNSUPPORTED_SOURCE` | Unrecognized source argument type |
+| `CONVERGENCE` | `stco -> co64` fixed-point loop did not converge within 64 iterations |
 
 ---
 
-## What is intentionally not implemented
+## 7. Complete API Reference
 
-stamp-js is a metadata/container editor, not a general media-processing framework.
+```ts
+type WriteOptions = {
+  metadataFormat?: 'auto' | 'mdir' | 'mdta';
+  nativeExif?: boolean; // default: true
+  mergeXmp?: boolean;   // default: false
+  materialize?: boolean; // default: true
+  chunkSize?: number;   // default: 4194304 (4 MiB)
+  mimeType?: string;
+};
 
-The following are intentionally refused or not implemented in the current release:
-
-```text
-AVIF
-HEIC
-WebP
-WebM
-MKV
-MP3
-FLAC
-fragmented MP4 / CMAF
-MP4 keyword writing
+writeTags(source, tags, options?): Promise<WriteResult>;
+inspect(source): Promise<InspectInfo>;
+capabilities(format): { format: string, supported: string[], unsupported: string[] };
+sniff(headBytes, mimeType?): string;
 ```
 
-XMP writes above the supported 64 KiB single-segment limit are also refused. Extended XMP fragments are recognised and removed — a fragment is stale the moment the standard packet is replaced — but their *content* is not merged into the rebuilt packet, and writing Extended XMP is a future extension.
-
-C2PA / JUMBF manifests are not updated by metadata writes. Applications that depend on content credentials should treat a metadata edit as a credential-affecting operation.
+Full TypeScript declarations are bundled in `src/stamp.d.ts` and `src/node.d.ts`.
 
 ---
 
-## Important limitations
+## 8. Memory Model & Safety Boundaries
 
-### JPEG / PNG header scan cap
-
-The insertion point must be within the first **8 MiB**. The scan starts small and grows as necessary rather than immediately loading 8 MiB.
-
-### MP4 memory depends on `moov`
-
-Large recordings can have large sample tables and therefore a larger `moov`. The payload size itself is not what drives the rewrite buffer.
-
-Use `inspect().mp4.moovSize` or the warning field before writing when processing long recordings.
-
-### Extended XMP fragments are dropped, not merged
-
-A JPEG whose XMP was split into a standard packet plus Extended XMP fragments
-(the >64 KiB layout Adobe writers produce) ends up with neither: the standard
-packet is rebuilt from the fields you pass, and every `xmp/extension` fragment is
-removed, because the rebuilt packet never declares `xmpNote:HasExtendedXMP` and a
-fragment whose GUID is not referenced is stale by definition. Verified against a
-file written by exiftool itself (2 fragments): both were removed, no dangling
-`HasExtendedXMP` was left behind, and exiftool reads the result. Fields that
-existed *only* inside the fragments are not carried over.
-
-### Synthesized EXIF on a file that has none
-
-When a JPEG carries no EXIF at all, stamp-js creates a minimal APP1 block so that
-`title` / `artist` / `copyright` still reach OS property sheets. That block
-contains only the fields being written, so `exiftool -validate` reports the other
-ExifIFD/IFD0 tags it expects in a camera JPEG as missing (`0x9101`
-ComponentsConfiguration, `0xa001` ColorSpace, `0xa002`/`0xa003` image
-dimensions, `0x0213` YCbCrPositioning — 5 warnings, measured on
-`1940534161.jpeg`, which validated clean before the write). A file that already
-had EXIF is unaffected: the rewrite is append-only and the same verification run
-saw a camera JPEG's 61 pre-existing warnings *drop* to 60.
-
-### Node stream lifetime
-
-`NodeFileSource` performs lazy reads while the output `ReadableStream` is consumed. Do not close the source before the stream is completely drained.
+* **MP4 memory scales with `moov`, not `mdat`**: Peak extra heap during an MP4 rewrite is `≈ 4.2× moovSize` (e.g., ~16 MB for a 3.82 MB `moov`, regardless of whether `mdat` is 20 MB or 8 GiB). A warning is added to `report.warnings` when `moov > 16 MiB`.
+* **JPEG / PNG header scan cap**: The insertion point must lie within the first **8 MiB** of the file.
+* **Project 8-byte shift alignment invariant**: When rewriting `moov` (including odd/even `stco → co64` upgrades), `planAlignedMoovGrowth()` pads with a `free` box so `finalDelta % 8 === 0`. (Note: ISO-BMFF does not mandate 8-byte media chunk offset alignment; this is a project-defined invariant.)
 
 ---
 
-## Verification
+## 9. Verification & Test Suite
 
-The package includes several verification layers covering unit behavior, malformed inputs, interoperability and real media.
-
-| Suite | Command | Assertion count in this release (0.1.1) |
+| Suite | Command | Assertion count in v0.1.2 |
 |---|---|---:|
-| Unit + regression | `npm test` | 387 on Node 20/22 |
-| Malformed / fuzz matrix | `npm run test:fuzz` | 196 |
-| Interop (`exiftool` + Pillow) | `npm run test:interop` | 38 |
-| Real device files | `npm run test:real` | 34 |
-| Independent verification | `npm run test:verify` | 90 CI + 47 real-media |
-| `ffprobe` cross-check | `npm run test:ffprobe` | 4 per real video |
+| Unit + regression | `npm test` | **498** on Node 18 / **505** on Node 20/22 |
+| Malformed / fuzz matrix | `npm run test:fuzz` | **196** (plus 3 skipped pre-malformed inputs) |
+| `ffprobe` / `ffmpeg` cross-check | `npm run test:ffprobe` | **79** (normal, repeated, large & boundary MP4/MOV + full decode) |
+| Interop (Pillow + XML + `ffprobe` + `exiftool`) | `npm run test:interop` | **31** baseline (+ **13** `exiftool` CLI checks) |
+| Independent verification | `npm run test:verify` | **90** baseline / **139** with real media (auto-skips when absent) |
+| Real device files | `npm run test:real` | **51** with the 6-file sample (auto-discovers media under `STAMP_TEST_MEDIA`) |
 
-The malformed-input suite checks invariants such as:
-
-```text
-no unexpected throw
-failure includes a reason
-output remains structurally valid
-media payload remains byte-identical
-repeat writes are idempotent
-```
-
-The real-media coverage includes examples such as motion photos, vendor-heavy JPEGs, WeChat exports, `moov`-at-tail videos, >4 GiB files with 64-bit offsets, and Android/MediaTek-style metadata layouts.
-
-The package's CI also checks that the built `dist/` output is not stale compared with the source.
-
----
-
-## Architecture
-
-The design is intentionally split into four layers:
-
-```text
-             Source
-               │
-      random-access reads
-               ↓
-       container probe/parser
-               ↓
-          rewrite planner
-               ↓
-      reference-slice output
-```
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed implementation notes, including:
-
-- the `Source` abstraction;
-- JPEG MPF rebasing;
-- PNG insertion without reading `IDAT`;
-- MP4 `moov` handling;
-- `stco` / `co64` rebasing;
-- fixed-point `stco → co64` upgrades;
-- EXIF IFD0 preservation strategy;
-- mixed `mdir` / `mdta` handling;
-- the MP4 memory model.
-
----
-
-## Why the project is deliberately small
-
-stamp-js is small because it does **not** try to become a video codec, media decoder, or universal file converter.
-
-Its job is narrower:
-
-```text
-Find the bytes that describe the file.
-Change only those bytes.
-Leave the media alone.
-```
-
-That narrow contract is what makes a very large input compatible with a comparatively small JavaScript memory footprint.
+All test runners strictly distinguish `PASS`, `FAIL`, `SKIP` (never counted as passed), and `NOT_RUN`.
 
 ---
 
 ## License
 
-MIT.
-
-See also [ARCHITECTURE.md](ARCHITECTURE.md), [CHANGELOG.md](CHANGELOG.md), and [RELEASING.md](RELEASING.md).
+[MIT](LICENSE) · See also [ARCHITECTURE.md](ARCHITECTURE.md), [CHANGELOG.md](CHANGELOG.md), and [VERIFICATION.md](VERIFICATION.md).

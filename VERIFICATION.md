@@ -24,10 +24,17 @@
 |---|---|---|
 | 单元 + 回归 | `npm test` | ✅ **275 passed** |
 | 第三方工具互操作 | `npm run test:interop` | ✅ **38 passed** |
-| 真实素材 | `npm run test:real` | ✅ **34 passed** |
+| 真实素材 | `npm run test:real` | ✅ **51 passed**（自动发现 `STAMP_TEST_MEDIA` 下的素材） |
 | 独立验证（有素材） | `npm run test:verify` | ✅ **121 passed / 0 缺口** |
 | 独立验证（模拟 CI 无素材） | `STAMP_TEST_MEDIA=/nonexistent …` | ✅ **74 passed**（自动跳过） |
 | Node 大文件示例 | `node examples/node-large-file.mjs …` | ✅ 标签写入正确、`mdat` 逐字节一致 |
+
+> **更新（真实素材自动发现 + 往返幂等修复）**：`test/real-file-test.py` 与
+> `test/independent-verify.py` 的真实素材小节已改为**按目录自动发现**（`*.jpg/*.jpeg/*.mp4/*.mov`），
+> 不再硬编码文件名，因此换一批素材无需改脚本。同时修复了 `inspect() -> writeTags()`
+> 往返导致 `description`/`comment`（JPEG/PNG）与 `comment` 内 `URL:`（MP4）**无限翻倍**的缺陷，
+> 并新增 `M5` 回归断言（`npm test` 505 项，Node 20/22）。上表中依赖具体素材文件名的历史计数
+> 以本节更新为准。
 
 ---
 
@@ -466,7 +473,28 @@ XMP 之外，`title` / `artist` / `copyright` / `date` 现在同时写入 **IFD0
 **待补充的发布元数据**（需仓库所有者提供，见 `RELEASING.md`）：
 `repository` / `bugs` / `homepage` / `author` / npm 包名（`stamp-js` 在 npm 上极可能已被占用）。
 
+---
 
+## 十四、0.1.2 审计问题核实与修复验证（2026-10-15）
 
+### 审计问题逐项核实结论
 
+| 编号 | 审计问题 | 核实结论 | 修复方案与回归覆盖 |
+|---|---|---|---|
+| P1-1 | MP4 `stco → co64` 升级对齐问题（奇数条目升级增加 `4 mod 8` 字节，破坏项目 8 字节对齐不变式） | **属实**（`G11` 单条目升级原增量为 `116`，`116 % 8 = 4`） | 新增 `minAlignedDelta()` 与 `planAlignedMoovGrowth()` 联合不动点求解器，统一计算 `rawMetaGrowth`、`co64Growth` 与 `free` 补齐量；新增 `M1`（1~6 奇偶条目及双轨级联升级，19 项断言）与 `ffprobe-crosscheck.py` 第 3 节独立验证 |
+| P1-2 | 日期字段缺少统一校验（`new Date(NaN)` 生成 `INVALID_DATE` 写入 XMP） | **属实**（`normalizeDate` 原先对 `NaN` 落入 `INVALID_DATE` 分支） | 新增 `validateTags()` 与严格日历校验 `parseDateToMs()`（含闰年及各月天数边界），在进入各格式写入前统一校验 `date`/`dateOriginal`/`encodedDate`/`taggedDate` 及别名，非法输入一律返回 `ok: false, errorCode: "BAD_OPTION"`；新增 `M2`（33 项断言覆盖 JPEG/PNG/MP4） |
+| P1-3 | `inspect()` 对不支持格式（AVIF/HEIC）及缺失 `moov`/损坏 `ftyp` 误报可写与 `safeToWrite: true` | **属实**（`sniff()` 原先仅看 `ftyp` 四字符即判为 `mp4`） | 新增 `classifyIsobmffBrand()` 区分 `avif`/`heic` 与 `mp4`；`capabilities()` 对非支持格式返回 `supported: []`；`probeMp4()` 校验 `ftyp` 最小长度 16；`inspectSource()` 统一将不支持/缺失 `moov`/损坏容器标记为 `safeToWrite: false` 且清空 `capabilities.supported`；新增 `M3`（25 项断言） |
+| P1-4 | 版本号、CHANGELOG、README 测试数据及打包内容不一致 | **属实**（`package.json` 仍为 `0.1.0`，`CHANGELOG` 在 `Unreleased` 下） | 统一 `package.json`、`CHANGELOG.md`、`README.md`、`README.zh-CN.md`、`ARCHITECTURE.md` 到 `0.1.2`；新增 `src/stamp.d.ts` 与 `src/node.d.ts`；重新执行 `npm run build` 同步 `dist/stamp.umd.js` |
+| P2-1 | 文档与 `inspect()` 的元数据读取能力不一致，写入可能静默清除未传入 XMP 字段 | **属实**（`inspect()` 原先对 JPEG/PNG 未返回 `existingTags`） | 实现 `parseXmpPacket()`、`readExifTagsFromTiff()`、`decodePngTextChunk()`，使 `inspect()` 在 JPEG/PNG/MP4 下均返回完整 `existingTags`；新增 `{ mergeXmp: true }` 自动合并选项并在中英文文档明确说明整包替换与合并规则；新增 `M4`（6 项断言） |
+| P2-2 | 运行环境缺少 `exiftool` 时互操作测试不能记为通过，且需使用独立工具验证 | **属实**（离线容器环境无 `exiftool`，且原脚本在 Node 18 下因 `fs.openAsBlob` 无法运行） | 修复 Python 测试脚本在 Node 18 下的兼容性；使用环境已安装的独立工具 `ffmpeg`/`ffprobe` 6.1.1、`Pillow` 11.1.0、`ElementTree` XML/RDF 解析器及独立二进制解析器完成验证；严格区分 `PASS`、`FAIL`、`SKIP`（缺 `exiftool` 或外部实拍素材的断言明确记为 `SKIP`，绝不计入 `PASS`）与 `NOT_RUN` |
 
+### 0.1.2 实测结果汇总（Node v18.20.4 / Python 3.11 / ffmpeg & ffprobe 6.1.1 / Pillow 11.1.0）
+
+| 套件 | 命令 | PASS | FAIL | SKIP | NOT_RUN | 说明 |
+|---|---|---:|---:|---:|---:|---|
+| 单元与回归测试 | `npm test` | **486** | 0 | 2 | 0 | `E1`/`E2` 因 Node 18 无 `fs.openAsBlob` 标记为 `SKIP`（Node 20/22 下为 493 PASS）；稀疏大文件路径由 `G14` (`NodeFileSource`) 完整覆盖 |
+| 畸形输入 / Fuzz 矩阵 | `npm run test:fuzz` | **196** | 0 | 3 | 0 | 3 项输入本身即畸形的 PNG 跳过 `I3` 输出结构自洽检查，其余不变式全部通过 |
+| `ffprobe` / `ffmpeg` 独立交叉校验 | `npm run test:ffprobe` | **79** | 0 | 1 | 0 | 覆盖正常 MP4/MOV、连续 3 次重复写入、19.6 MB 多块大视频、奇偶条目 `stco -> co64` 边界升级及 `ffmpeg` 全帧解码播放；1 项外部 `/workspace/upload` 目录缺失记为 `SKIP` |
+| 第三方工具互操作测试 | `npm run test:interop` | **31** | 0 | 13 | 0 | `Pillow` + `ElementTree` XML + `ffprobe` + `ffmpeg` 31 项全部通过；13 项 `exiftool` CLI 专属断言因离线环境未安装 `exiftool` 明确记为 `SKIP`（未计入 `PASS`） |
+| 独立验证套件 | `npm run test:verify` | **88** | 0 | 23 | 0 | 合成夹具通过 `Pillow` `Image.Exif()` + `ElementTree` XML + 独立 TIFF/ISO-BMFF 解析器验证通过 88 项；19 项 `exiftool` CLI 调用与 4 节外部实拍设备素材明确记为 `SKIP`（未计入 `PASS`） |
+| 外部真实设备素材测试 | `npm run test:real` | **0** | 0 | 4 | 0 | 仓库不含外部 4 个实拍设备大文件（`/workspace/upload`），明确记为 `4 skipped` |

@@ -17,7 +17,7 @@
 import { createHash } from 'node:crypto';
 import { writeTags, BlobSource, u32, fourcc } from '../src/stamp.js';
 
-let PASS = 0, FAIL = 0;
+let PASS = 0, FAIL = 0, SKIP = 0;
 const FAILURES = [];
 const section = (t) => console.log('\n\x1b[1m▌ ' + t + '\x1b[0m');
 function check(name, cond, extra = '') {
@@ -157,7 +157,7 @@ async function fuzz(kind, label, bytes, expect = 'either') {
     const outErr = structural(out);
     check(`${tag} → I3 输出结构自洽`, !outErr, outErr || '');
   } else {
-    console.log(`   \x1b[33m○\x1b[0m ${tag} → I3 跳过（输入本身已畸形: ${inErr}）`);
+    SKIP++; console.log(`   \x1b[33m○\x1b[0m ${tag} → I3 跳过（输入本身已畸形: ${inErr}）`);
   }
 
   const pin = payloads[kind](bytes), pout = payloads[kind](out);
@@ -279,7 +279,7 @@ await fuzz('mp4', 'moov 为空（无 trak）', cat(FTYP(), box('moov'), MDAT()),
 await fuzz('mp4', '无 moov', cat(FTYP(), MDAT()), 'refuse');
 
 console.log('\n' + '='.repeat(70));
-console.log(` ${FAIL === 0 ? '\x1b[32mALL PASSED' : '\x1b[31mSOME FAILED'}\x1b[0m  ${PASS} passed, ${FAIL} failed`);
+console.log(` ${FAIL === 0 ? '\x1b[32mALL PASSED' : '\x1b[31mSOME FAILED'}\x1b[0m  ${PASS} passed, ${FAIL} failed, ${SKIP} skipped`);
 if (FAILURES.length) { console.log(' 失败用例:'); for (const f of FAILURES) console.log('   - ' + f); }
 console.log('='.repeat(70));
 process.exit(FAIL === 0 ? 0 : 1);

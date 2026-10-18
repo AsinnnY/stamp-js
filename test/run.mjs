@@ -19,7 +19,7 @@ import { writeTags, inspect, capabilities, BlobSource, BufferSource, HttpSource,
 import { NodeFileSource } from '../src/node.js';
 import * as F from './fixtures.mjs';
 
-let PASS = 0, FAIL = 0;
+let PASS = 0, FAIL = 0, SKIP = 0;
 const pad = (s, n) => String(s).padEnd(n);
 function section(t) { console.log('\n\x1b[1m▌ ' + t + '\x1b[0m'); }
 function check(name, cond, extra = '') {
@@ -430,7 +430,7 @@ function makeSparseFile(file, totalSize, plan) {
 // still covered by the NodeFileSource cases (G14) and this Blob-backed variant
 // is reported as skipped rather than silently dropped.
 if (typeof fs.openAsBlob !== 'function') {
-  console.log('      \x1b[33m⚠ SKIP\x1b[0m E1 (fs.openAsBlob needs Node 20+; G14 covers the sparse path on Node 18)');
+  SKIP++; console.log('      \x1b[33m⚠ SKIP\x1b[0m E1 (fs.openAsBlob needs Node 20+; G14 covers the sparse path on Node 18)');
 } else {
   const BIG = 2 * 1024 ** 3;
   const plan = F.buildSparseMp4Plan(BIG, { chunks: 64, chunkSize: 1 << 20 });
@@ -464,7 +464,7 @@ if (typeof fs.openAsBlob !== 'function') {
 
 // ---------- E2: 256 MiB, new vs old impl peak memory comparison ----------
 if (typeof fs.openAsBlob !== 'function') {
-  console.log('      \x1b[33m⚠ SKIP\x1b[0m E2 (fs.openAsBlob needs Node 20+)');
+  SKIP++; console.log('      \x1b[33m⚠ SKIP\x1b[0m E2 (fs.openAsBlob needs Node 20+)');
 } else {
   const MID = 256 * 1024 ** 2;
   const plan = F.buildSparseMp4Plan(MID, { chunks: 32, chunkSize: 1 << 20 });
@@ -1205,32 +1205,37 @@ section('G. Regression: bug fixes from external review');
       check('MP4 mdta: existing key preserved', keys.includes('genre'), JSON.stringify(keys));
     }
   }
-  // keywords must be refused, not silently dropped
+  // keywords supported in both mdir (©key) and mdta (keywords)
   {
     const input = c2(ftyp2(), box2('moov', mvhd2()), mdat2());
-    const only = await writeTags(new BlobSource(new Blob([input])), { keywords: ['a', 'b'] });
-    check('MP4 keywords-only: refused', only.ok === false, 'ok=true means it was silently dropped');
-    check('MP4 keywords-only: errorCode is UNSUPPORTED_TAG', only.report.errorCode === 'UNSUPPORTED_TAG',
-      String(only.report.errorCode));
-    check('MP4 keywords-only: report names the unsupported field',
-      JSON.stringify(only.report.unsupportedTags) === '["keywords"]', JSON.stringify(only.report.unsupportedTags));
-    check('MP4 keywords-only: message lists what IS supported',
-      /title, artist, date, comment, url, software, copyright/.test(only.report.error || ''), only.report.error);
+    const only = await writeTags(new BlobSource(new Blob([input])), { keywords: ['alpha', 'beta'] });
+    check('MP4 keywords-only (mdir): write succeeds', only.ok === true, only.report?.error);
+    const outOnly = await bytesOf(only);
+    const parsedOnly = readTags(outOnly);
+    check('MP4 keywords-only (mdir): stored under ©key',
+      parsedOnly.tags['©key'] === 'alpha, beta', JSON.stringify(parsedOnly.tags));
+    const mdtaRes = await writeTags(new BlobSource(new Blob([input])), { keywords: ['k1', 'k2'] }, { metadataFormat: 'mdta' });
+    check('MP4 keywords (mdta): write succeeds', mdtaRes.ok === true, mdtaRes.report?.error);
+    const parsedMdta = readTags(await bytesOf(mdtaRes));
+    check('MP4 keywords (mdta): stored under keywords key',
+      parsedMdta.tags.keywords === 'k1, k2', JSON.stringify(parsedMdta.tags));
     const mixed = await writeTags(new BlobSource(new Blob([input])), { title: 'T', keywords: ['a'] });
-    check('MP4 title+keywords: refused as a whole (no silent partial write)',
-      mixed.ok === false && mixed.report.errorCode === 'UNSUPPORTED_TAG');
+    check('MP4 title+keywords: writes both fields',
+      mixed.ok === true && readTags(await bytesOf(mixed)).tags['©key'] === 'a');
     const okCopy = await writeTags(new BlobSource(new Blob([input])), { title: 'T', copyright: 'C' });
     check('MP4 title+copyright: supported combination still writes', okCopy.ok, okCopy.report?.error);
   }
   // capabilities() must agree with what writeTags accepts
   {
     const mp4 = capabilities('mp4'), jpeg = capabilities('jpeg');
-    check('capabilities(mp4): supports copyright, not keywords',
-      mp4.supported.includes('copyright') && mp4.unsupported.join() === 'keywords');
-    check('capabilities(jpeg): supports all 8 fields', jpeg.unsupported.length === 0 && jpeg.supported.length === 8);
+    check('capabilities(mp4): supports copyright, keywords, encodedDate, taggedDate, gps',
+      mp4.supported.includes('copyright') && mp4.supported.includes('keywords')
+      && mp4.supported.includes('encodedDate') && mp4.supported.includes('taggedDate')
+      && mp4.unsupported.length === 0);
+    check('capabilities(jpeg): supports all 18 fields', jpeg.unsupported.length === 0 && jpeg.supported.length === 18);
     const info = await inspect(new BlobSource(new Blob([c2(ftyp2(), box2('moov', mvhd2()), mdat2())])));
     check('inspect(): exposes the capability matrix', info.capabilities &&
-      info.capabilities.unsupported.join() === 'keywords', JSON.stringify(info.capabilities));
+      info.capabilities.supported.length === 18 && info.capabilities.unsupported.length === 0, JSON.stringify(info.capabilities));
   }
 }
 
@@ -2185,6 +2190,486 @@ section('K. Review fixes: error boundaries, no silent data loss, alignment');
   }
 }
 
+
 /* ===================================================================== */
-console.log(`\n\x1b[1m${FAIL === 0 ? '\x1b[32mALL PASSED' : '\x1b[31mSOME FAILED'}\x1b[0m  ${PASS} passed, ${FAIL} failed\n`);
+section('L. MP4 Encoded/Tagged Dates (mvhd/tkhd/mdhd) & Extended Image/Video Fields');
+{
+  const { toMp4EpochSeconds, fromMp4EpochSeconds } = await import('../src/stamp.js');
+
+  // Helper to read mvhd, tkhd, mdhd timestamps from an MP4 buffer
+  function readMp4BoxTimestamps(b) {
+    const out = { mvhd: null, tkhd: [], mdhd: [] };
+    const t = topBoxes(b);
+    const moov = t.boxes.find((x) => x.type === 'moov');
+    if (!moov) return out;
+    const readTs = (box) => {
+      const ver = b[box.pos + 8];
+      if (ver === 0) return { ver, creation: u32(b, box.pos + 12), modification: u32(b, box.pos + 16) };
+      return { ver, creation: u64(b, box.pos + 12), modification: u64(b, box.pos + 20) };
+    };
+    for (const c of children(b, moov)) {
+      if (c.type === 'mvhd') out.mvhd = readTs(c);
+      if (c.type === 'trak') {
+        for (const tc of children(b, c)) {
+          if (tc.type === 'tkhd') out.tkhd.push(readTs(tc));
+          if (tc.type === 'mdia') {
+            for (const mc of children(b, tc)) {
+              if (mc.type === 'mdhd') out.mdhd.push(readTs(mc));
+            }
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  // L1: Passing `date` automatically syncs mvhd/tkhd/mdhd creation_time (Encoded date) and modification_time (Tagged date)
+  {
+    const fx = F.buildMp4({ layout: 'head' });
+    const iso = '2026-04-02T09:30:00Z';
+    const wantSec = toMp4EpochSeconds(iso);
+    const res = await writeTags(new BlobSource(new Blob([fx.bytes])), { title: 'Date Sync', date: iso });
+    check('L1 MP4 date sync: write succeeds', res.ok, res.report?.error);
+    const out = await bytesOf(res);
+    const ts = readMp4BoxTimestamps(out);
+    check('L1 MP4 date sync: mvhd creation_time & modification_time updated',
+      ts.mvhd && ts.mvhd.creation === wantSec && ts.mvhd.modification === wantSec, JSON.stringify(ts.mvhd));
+    check('L1 MP4 date sync: tkhd creation_time & modification_time updated',
+      ts.tkhd.length === 1 && ts.tkhd[0].creation === wantSec && ts.tkhd[0].modification === wantSec, JSON.stringify(ts.tkhd));
+    check('L1 MP4 date sync: mdhd creation_time & modification_time updated',
+      ts.mdhd.length === 1 && ts.mdhd[0].creation === wantSec && ts.mdhd[0].modification === wantSec, JSON.stringify(ts.mdhd));
+    const info = await inspect(new BlobSource(new Blob([out])));
+    check('L1 MP4 inspect(): reads back encodedDate and taggedDate',
+      info.mp4.encodedDate === iso && info.mp4.taggedDate === iso,
+      JSON.stringify({ encodedDate: info.mp4.encodedDate, taggedDate: info.mp4.taggedDate }));
+  }
+
+  // L2: Explicit `encodedDate` and `taggedDate` set distinct timestamps & work header-only (delta === 0)
+  {
+    const fx = F.buildMp4({ layout: 'head' });
+    const encIso = '2026-05-01T08:00:00Z';
+    const tagIso = '2026-05-02T18:45:30Z';
+    const encSec = toMp4EpochSeconds(encIso);
+    const tagSec = toMp4EpochSeconds(tagIso);
+    const res = await writeTags(new BlobSource(new Blob([fx.bytes])), { encodedDate: encIso, taggedDate: tagIso });
+    check('L2 MP4 header-only encodedDate+taggedDate: write succeeds', res.ok, res.report?.error);
+    const out = await bytesOf(res);
+    check('L2 MP4 header-only encodedDate+taggedDate: zero file size growth (delta === 0)',
+      out.length === fx.bytes.length && res.report.delta === 0, `len ${fx.bytes.length} -> ${out.length}`);
+    const ts = readMp4BoxTimestamps(out);
+    check('L2 MP4 header-only: mvhd creation_time == encodedDate, modification_time == taggedDate',
+      ts.mvhd.creation === encSec && ts.mvhd.modification === tagSec, JSON.stringify(ts.mvhd));
+    check('L2 MP4 header-only: tkhd & mdhd match encodedDate & taggedDate',
+      ts.tkhd[0].creation === encSec && ts.tkhd[0].modification === tagSec
+      && ts.mdhd[0].creation === encSec && ts.mdhd[0].modification === tagSec);
+    // Second write with same header dates is a byte-identical idempotent no-op
+    const res2 = await writeTags(new BlobSource(new Blob([out])), { encodedDate: encIso, taggedDate: tagIso });
+    const out2 = await bytesOf(res2);
+    check('L2 MP4 header-only: second write is byte-identical',
+      res2.ok && out2.length === out.length && out2.every((v, i) => v === out[i]));
+    // Invalid encodedDate is rejected with BAD_OPTION
+    const bad = await writeTags(new BlobSource(new Blob([fx.bytes])), { encodedDate: 'not-a-date' });
+    check('L2 MP4 invalid encodedDate: refused with BAD_OPTION',
+      !bad.ok && bad.report.errorCode === 'BAD_OPTION', JSON.stringify(bad.report));
+  }
+
+  // L3: Version 1 (64-bit) mvhd / tkhd / mdhd boxes
+  {
+    const u32b = (n) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+    const u64b = (n) => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(n)); return b; };
+    const ascii = (s) => new Uint8Array([...s].map((c) => c.charCodeAt(0) & 255));
+    const zeros = (n) => new Uint8Array(n);
+    const cat = (...a) => { const f = a.flat(); const n = f.reduce((s, c) => s + c.length, 0); const o = new Uint8Array(n); let p = 0; for (const c of f) { o.set(c, p); p += c.length; } return o; };
+    const box = (t, ...b) => { const x = cat(...b); return cat(u32b(8 + x.length), ascii(t), x); };
+    const full = (t, ver, flags, ...b) => { const x = cat(...b); return cat(u32b(12 + x.length), ascii(t), new Uint8Array([ver, (flags >> 16) & 255, (flags >> 8) & 255, flags & 255]), x); };
+    const ftyp = box('ftyp', ascii('isom'), u32b(0x200), ascii('isom'), ascii('iso2'), ascii('avc1'), ascii('mp41'));
+    const mvhdV1 = full('mvhd', 1, 0, u64b(0), u64b(0), u32b(1000), u64b(10000), zeros(80));
+    const tkhdV1 = full('tkhd', 1, 3, u64b(0), u64b(0), u32b(1), zeros(4), u64b(10000), zeros(60));
+    const mdhdV1 = full('mdhd', 1, 0, u64b(0), u64b(0), u32b(30000), u64b(300000), zeros(4));
+    const mp4V1 = cat(ftyp, box('moov', mvhdV1, box('trak', tkhdV1, box('mdia', mdhdV1))), box('mdat', zeros(64)));
+    const encIso = '2026-06-15T10:20:30Z';
+    const tagIso = '2026-06-16T11:22:33Z';
+    const res = await writeTags(new BlobSource(new Blob([mp4V1])), { encodedDate: encIso, taggedDate: tagIso, title: 'V1 Box' });
+    check('L3 MP4 v1 (64-bit) mvhd/tkhd/mdhd: write succeeds', res.ok, res.report?.error);
+    const out = await bytesOf(res);
+    const ts = readMp4BoxTimestamps(out);
+    check('L3 MP4 v1 (64-bit): mvhd, tkhd, mdhd 64-bit timestamps match',
+      ts.mvhd.ver === 1 && ts.mvhd.creation === toMp4EpochSeconds(encIso) && ts.mvhd.modification === toMp4EpochSeconds(tagIso)
+      && ts.tkhd[0].creation === toMp4EpochSeconds(encIso) && ts.mdhd[0].modification === toMp4EpochSeconds(tagIso),
+      JSON.stringify(ts));
+  }
+
+  // L4: Extended fields in MP4 (mdir and mdta): description, dateOriginal, album, genre, make, model, gps, rating, keywords, url
+  {
+    const extTags = {
+      title: 'Full MP4', artist: 'Creator', date: '2026-07-01T00:00:00Z',
+      dateOriginal: '2026-06-30T12:00:00Z', encodedDate: '2026-07-01T01:00:00Z', taggedDate: '2026-07-01T02:00:00Z',
+      description: 'Detailed video synopsis', comment: 'Director note', url: 'https://example.com/v',
+      software: 'stamp-js', copyright: '© 2026', keywords: ['travel', '4k'],
+      album: 'Summer Trip', genre: 'Documentary', make: 'Sony', model: 'FX3',
+      gps: { lat: 35.6895, lon: 139.6917, alt: 40 }, rating: 5,
+    };
+    const fx = F.buildMp4({ layout: 'head' });
+    const rMdir = await writeTags(new BlobSource(new Blob([fx.bytes])), extTags, { metadataFormat: 'mdir' });
+    check('L4 MP4 extended fields (mdir): write succeeds', rMdir.ok, rMdir.report?.error);
+    const pMdir = readTags(await bytesOf(rMdir)).tags;
+    check('L4 MP4 extended fields (mdir): desc, ©alb, ©gen, ©mak, ©mod, ©xyz, rate, ©key, ©url written',
+      pMdir.desc === 'Detailed video synopsis' && pMdir['©alb'] === 'Summer Trip'
+      && pMdir['©gen'] === 'Documentary' && pMdir['©mak'] === 'Sony'
+      && pMdir['©mod'] === 'FX3' && pMdir['©xyz'] === '+35.6895+139.6917+40.00/'
+      && pMdir.rate === '5' && pMdir['©key'] === 'travel, 4k' && pMdir['©url'] === 'https://example.com/v',
+      JSON.stringify(pMdir));
+
+    const rMdta = await writeTags(new BlobSource(new Blob([fx.bytes])), extTags, { metadataFormat: 'mdta' });
+    check('L4 MP4 extended fields (mdta): write succeeds', rMdta.ok, rMdta.report?.error);
+    const pMdta = readTags(await bytesOf(rMdta)).tags;
+    check('L4 MP4 extended fields (mdta): QuickTime & mdta keys written',
+      pMdta.description === 'Detailed video synopsis' && pMdta.album === 'Summer Trip'
+      && pMdta.genre === 'Documentary' && pMdta['com.apple.quicktime.make'] === 'Sony'
+      && pMdta['com.apple.quicktime.model'] === 'FX3'
+      && pMdta['com.apple.quicktime.location.ISO6709'] === '+35.6895+139.6917+40.00/'
+      && pMdta['com.apple.quicktime.creationdate'] === '2026-06-30T12:00:00Z'
+      && pMdta['com.apple.quicktime.rating.user'] === '5'
+      && pMdta.keywords === 'travel, 4k' && pMdta.url === 'https://example.com/v',
+      JSON.stringify(pMdta));
+  }
+
+  // L5: Extended fields in JPEG & PNG (EXIF DateTimeOriginal, DateTimeDigitized, Make, Model, Rating, GPSIFD + XMP + PNG iTXt)
+  {
+    const extImgTags = {
+      title: 'Tokyo Tower', description: 'Night view', artist: 'Alice',
+      date: '2026-08-01T20:00:00Z', dateOriginal: '2026-08-01T19:00:00Z',
+      encodedDate: '2026-08-01T19:30:00Z', taggedDate: '2026-08-02T10:00:00Z',
+      comment: 'Shot handheld', copyright: '© 2026 Alice', software: 'stamp-js',
+      album: 'Japan 2026', genre: 'Architecture', make: 'Nikon', model: 'Z8',
+      gps: { lat: 35.6586, lon: 139.7454, alt: 150 }, rating: 4, keywords: ['tokyo', 'night'],
+    };
+    const jpgFx = F.buildJpegWithExif();
+    const rJpg = await writeTags(new BlobSource(new Blob([jpgFx.bytes])), extImgTags);
+    check('L5 JPEG extended fields: write succeeds', rJpg.ok, rJpg.report?.error);
+    const outJpg = await bytesOf(rJpg);
+    const xmpText = readJpegXmpSegments(outJpg)[0]?.text || '';
+    check('L5 JPEG XMP: carries ModifyDate, MetadataDate, DateTimeOriginal, DateTimeDigitized, Make, Model, Album, Genre, Rating, GPS',
+      xmpText.includes('<xmp:ModifyDate>2026-08-02T10:00:00Z</xmp:ModifyDate>')
+      && xmpText.includes('<xmp:MetadataDate>2026-08-02T10:00:00Z</xmp:MetadataDate>')
+      && xmpText.includes('<exif:DateTimeOriginal>2026-08-01T19:00:00Z</exif:DateTimeOriginal>')
+      && xmpText.includes('<exif:DateTimeDigitized>2026-08-01T19:30:00Z</exif:DateTimeDigitized>')
+      && xmpText.includes('<tiff:Make>Nikon</tiff:Make>')
+      && xmpText.includes('<tiff:Model>Z8</tiff:Model>')
+      && xmpText.includes('<xmpDM:album>Japan 2026</xmpDM:album>')
+      && xmpText.includes('<xmpDM:genre>Architecture</xmpDM:genre>')
+      && xmpText.includes('<xmp:Rating>4</xmp:Rating>')
+      && xmpText.includes('<exif:GPSLatitude>'),
+      xmpText.slice(0, 300));
+    const rJpg2 = await writeTags(new BlobSource(new Blob([outJpg])), extImgTags);
+    const outJpg2 = await bytesOf(rJpg2);
+    check('L5 JPEG extended fields: second write is byte-identical (idempotent)',
+      rJpg2.ok && outJpg2.length === outJpg.length && outJpg2.every((v, i) => v === outJpg[i]));
+
+    const pngFx = F.buildPng({ withXmp: false });
+    const rPng = await writeTags(new BlobSource(new Blob([pngFx.bytes])), extImgTags);
+    check('L5 PNG extended fields: write succeeds', rPng.ok, rPng.report?.error);
+    const outPng = await bytesOf(rPng);
+    const pngStr = new TextDecoder().decode(outPng);
+    check('L5 PNG extended fields: iTXt chunks carry Encoded Time, Modify Time, Source, Collection, Genre, Location, Rating',
+      pngStr.includes('Encoded Time') && pngStr.includes('Modify Time')
+      && pngStr.includes('Nikon Z8') && pngStr.includes('Japan 2026')
+      && pngStr.includes('Architecture') && pngStr.includes('+35.6586+139.7454+150.00/'));
+    const rPng2 = await writeTags(new BlobSource(new Blob([outPng])), extImgTags);
+    const outPng2 = await bytesOf(rPng2);
+    check('L5 PNG extended fields: second write is byte-identical (idempotent)',
+      rPng2.ok && outPng2.length === outPng.length && outPng2.every((v, i) => v === outPng[i]));
+  }
+}
+
+
+/* ===================================================================== */
+section('M. v0.1.2 Review Regressions: co64 Alignment, Date Validation, inspect() Consistency & XMP Round-Trip');
+{
+  const { sniff, parseXmpPacket } = await import('../src/stamp.js');
+  const c2 = (...a) => { const f = a.flat(); const n = f.reduce((s, c) => s + c.length, 0); const o = new Uint8Array(n); let p = 0; for (const c of f) { o.set(c, p); p += c.length; } return o; };
+  const u2 = (n) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+  const a2 = (s) => new Uint8Array([...s].map((c) => c.charCodeAt(0) & 255));
+  const z2 = (n) => new Uint8Array(n);
+  const box2 = (t, ...b) => { const x = c2(...b); return c2(u2(8 + x.length), a2(t), x); };
+  const full2 = (t, ...b) => { const x = c2(...b); return c2(u2(12 + x.length), a2(t), z2(4), x); };
+
+  // ---- M1 (P1-1): stco -> co64 upgrade maintains 8-byte alignment invariant for odd & even entry counts ----
+  {
+    for (const count of [1, 2, 3, 4, 5, 6]) {
+      const baseOff = 0xFFFFFFF0 - (count - 1) * 4;
+      const rawOffsets = Array.from({ length: count }, (_, i) => baseOff + i * 4);
+      const FAKE_SIZE = 0xFFFFFFFF + 4096;
+      const ftp = c2(u2(32), a2('ftyp'), a2('isom'), u2(0x200), a2('isom'), a2('iso2'), a2('avc1'), a2('mp41'));
+      const mvhd = c2(u2(108), a2('mvhd'), z2(100));
+      const stco = full2('stco', u2(count), ...rawOffsets.map(u2));
+      const trak = box2('trak', box2('mdia', box2('minf', box2('stbl', stco))));
+      const moov = box2('moov', mvhd, trak);
+      const head = c2(ftp, moov);
+      const mdatSize = FAKE_SIZE - head.length;
+      const realHead = c2(head, u2(1), a2('mdat'), (() => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(mdatSize)); return b; })());
+
+      class OddEvenHugeSource extends BufferSource {
+        constructor() { super(realHead, 'video/mp4'); this.size = FAKE_SIZE; }
+        async read(start, end) {
+          if (end <= this.bytes.length) return this.bytes.subarray(start, end);
+          const out = new Uint8Array(end - start);
+          const avail = Math.max(0, Math.min(this.bytes.length - start, out.length));
+          if (avail > 0) out.set(this.bytes.subarray(start, start + avail), 0);
+          return out;
+        }
+        canSlice() { return false; }
+      }
+
+      const res = await writeTags(new OddEvenHugeSource(), { title: 'Huge File Test' }, { materialize: false });
+      check(`M1 co64 upgrade (entries=${count}): write succeeds`, res.ok, res.report?.error);
+      if (res.ok) {
+        const outMoov = res.parts.find((p) => p.kind === 'bytes').bytes;
+        const delta = outMoov.length - moov.length;
+        check(`M1 co64 upgrade (entries=${count}): final delta (${delta}) is a multiple of 8`,
+          delta === res.report.delta && ((delta % 8) + 8) % 8 === 0, `delta=${delta} report.delta=${res.report.delta}`);
+        const { stco: outStco, co64: outCo64 } = collectOffsets(outMoov);
+        check(`M1 co64 upgrade (entries=${count}): all ${count} entries upgraded and shifted by exact delta`,
+          outStco.length === 0 && outCo64.length === count && outCo64.every((v, i) => v === rawOffsets[i] + delta),
+          JSON.stringify({ outCo64, expected: rawOffsets.map((v) => v + delta) }));
+      }
+    }
+
+    // Cascade case: trak 1 (1 entry) overflows at rawMetaGrowth (+100), adding +4 co64 bytes -> 104,
+    // which pushes trak 2 (3 entries at 0xFFFFFFFF - 102) over 2^32, adding +12 co64 bytes -> 116 + 12 pad = 128!
+    {
+      const FAKE_SIZE = 0xFFFFFFFF + 4096;
+      const ftp = c2(u2(32), a2('ftyp'), a2('isom'), u2(0x200), a2('isom'), a2('iso2'), a2('avc1'), a2('mp41'));
+      const mvhd = c2(u2(108), a2('mvhd'), z2(100));
+      const trak1 = box2('trak', box2('mdia', box2('minf', box2('stbl', full2('stco', u2(1), u2(0xFFFFFFF0))))));
+      const trak2 = box2('trak', box2('mdia', box2('minf', box2('stbl', full2('stco', u2(3), u2(0xFFFFFFFF - 94), u2(0xFFFFFFFF - 93), u2(0xFFFFFFFF - 92))))));
+      const moov = box2('moov', mvhd, trak1, trak2);
+      const mdatSz = FAKE_SIZE - ftp.length - moov.length; const head = c2(ftp, moov, u2(1), a2('mdat'), (() => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(mdatSz)); return b; })());
+      class CascadeSource extends BufferSource {
+        constructor() { super(head, 'video/mp4'); this.size = FAKE_SIZE; }
+        async read(s, e) {
+          if (e <= this.bytes.length) return this.bytes.subarray(s, e);
+          const out = new Uint8Array(e - s);
+          const avail = Math.max(0, Math.min(this.bytes.length - s, out.length));
+          if (avail > 0) out.set(this.bytes.subarray(s, s + avail), 0);
+          return out;
+        }
+        canSlice() { return false; }
+      }
+      const res = await writeTags(new CascadeSource(), { title: 'Cascade' }, { materialize: false });
+      const outMoov = res.parts.find((p) => p.kind === 'bytes').bytes;
+      const delta = outMoov.length - moov.length;
+      const { stco: sOut, co64: cOut } = collectOffsets(outMoov);
+      check('M1 cascade co64 upgrade: both traks upgraded, delta is 8-aligned, all 4 offsets match',
+        res.ok && delta % 8 === 0 && sOut.length === 0 && cOut.length === 4
+        && cOut[0] === 0xFFFFFFF0 + delta && cOut[1] === (0xFFFFFFFF - 94) + delta,
+        `delta=${delta} cOut=${JSON.stringify(cOut)}`);
+    }
+  }
+
+  // ---- M2 (P1-2): Unified strict date validation across JPEG, PNG, and MP4 ----
+  {
+    const targets = [
+      ['JPEG', F.buildJpeg().bytes],
+      ['PNG', F.buildPng().bytes],
+      ['MP4', F.buildMp4({ layout: 'head' }).bytes],
+    ];
+    const badPayloads = [
+      ['date: new Date(NaN)', { date: new Date(NaN) }],
+      ['encodedDate: new Date(NaN)', { title: 'T', encodedDate: new Date(NaN) }],
+      ['taggedDate: new Date("invalid")', { title: 'T', taggedDate: new Date('invalid') }],
+      ['dateOriginal: "not-a-date"', { title: 'T', dateOriginal: 'not-a-date' }],
+      ['date: "INVALID_DATE"', { date: 'INVALID_DATE' }],
+      ['date: "2026-02-30T10:00:00Z" (impossible calendar day)', { date: '2026-02-30T10:00:00Z' }],
+      ['date: "2026-13-01T00:00:00Z" (invalid month)', { date: '2026-13-01T00:00:00Z' }],
+      ['date: NaN', { title: 'T', date: NaN }],
+      ['creationTime alias: "garbage"', { title: 'T', creationTime: 'garbage' }],
+    ];
+    for (const [fmt, bytes] of targets) {
+      for (const [desc, badTags] of badPayloads) {
+        const r = await writeTags(new BlobSource(new Blob([bytes])), badTags);
+        check(`M2 ${fmt} rejects invalid ${desc} with BAD_OPTION`,
+          r.ok === false && r.report.errorCode === 'BAD_OPTION' && !r.blob && !r.parts,
+          JSON.stringify(r.report));
+      }
+      // Valid Date instance, EXIF string, and date-only string must succeed
+      const okDate = await writeTags(new BlobSource(new Blob([bytes])), {
+        date: new Date('2026-04-02T09:30:00Z'),
+        encodedDate: '2026:04:02 09:30:00',
+        taggedDate: '2026-04-03',
+      });
+      check(`M2 ${fmt} accepts valid Date instance, EXIF date string, and YYYY-MM-DD`,
+        okDate.ok === true, okDate.report?.error);
+      const outBytes = await bytesOf(okDate);
+      check(`M2 ${fmt} output never contains INVALID_DATE`,
+        !new TextDecoder().decode(outBytes).includes('INVALID_DATE'));
+    }
+  }
+
+  // ---- M3 (P1-3): sniff(), inspect(), and writeTags() consistency on AVIF, HEIC, corrupt ftyp, moov-less, and valid MP4/MOV ----
+  {
+    const ftypBox = (brand, compat = [brand, 'mif1']) => {
+      const body = c2(a2(brand), u2(0), ...compat.map(a2));
+      return c2(u2(8 + body.length), a2('ftyp'), body);
+    };
+    const avifBytes = ftypBox('avif', ['avif', 'mif1']);
+    const mif1AvifBytes = ftypBox('mif1', ['mif1', 'avif']);
+    const heicBytes = ftypBox('heic', ['heic', 'mif1']);
+    const moovlessMp4 = ftypBox('isom', ['isom', 'mp42']);
+    const moovlessMov = ftypBox('qt  ', ['qt  ']);
+    const corruptFtyp = c2(u2(10), a2('ftyp'), a2('is')); // size 10 < 16 minimum for ftyp
+    const unknownBytes = a2('NOT_A_MEDIA_CONTAINER_AT_ALL');
+
+    check('M3 sniff(avif) returns "avif" (not "mp4")', sniff(avifBytes) === 'avif' && sniff(mif1AvifBytes) === 'avif');
+    check('M3 sniff(heic) returns "heic" (not "mp4")', sniff(heicBytes) === 'heic');
+
+    for (const [label, bytes, expectedFmt, expectedCode] of [
+      ['AVIF (major=avif)', avifBytes, 'avif', 'UNSUPPORTED_FORMAT'],
+      ['AVIF (major=mif1, compat=avif)', mif1AvifBytes, 'avif', 'UNSUPPORTED_FORMAT'],
+      ['HEIC (major=heic)', heicBytes, 'heic', 'UNSUPPORTED_FORMAT'],
+      ['unknown binary', unknownBytes, 'unknown', 'UNSUPPORTED_FORMAT'],
+      ['MP4 missing moov', moovlessMp4, 'mp4', 'MALFORMED_CONTAINER'],
+      ['MOV missing moov', moovlessMov, 'mp4', 'MALFORMED_CONTAINER'],
+      ['corrupt ftyp (size < 16)', corruptFtyp, 'mp4', 'MALFORMED_CONTAINER'],
+    ]) {
+      const inf = await inspect(new BufferSource(bytes));
+      const wr = await writeTags(new BufferSource(bytes), { title: 'Test' });
+      check(`M3 ${label}: inspect() reports format=${expectedFmt} and safeToWrite=false`,
+        inf.format === expectedFmt && inf.safeToWrite === false && (!inf.mp4 || inf.mp4.safeToWrite === false),
+        JSON.stringify(inf));
+      check(`M3 ${label}: inspect() capabilities.supported is empty []`,
+        Array.isArray(inf.capabilities?.supported) && inf.capabilities.supported.length === 0,
+        JSON.stringify(inf.capabilities));
+      check(`M3 ${label}: inspect() errorCode=${expectedCode} and writeTags() also refuses`,
+        inf.errorCode === expectedCode && wr.ok === false && !!wr.report.errorCode,
+        `inspect=${inf.errorCode} write=${wr.report.errorCode}`);
+    }
+
+    // Valid MP4 and MOV must still be accepted by both inspect() and writeTags()
+    const validMp4 = F.buildMp4({ layout: 'head' }).bytes;
+    const validMov = c2(ftypBox('qt  ', ['qt  ', 'isom']), validMp4.subarray(32));
+    for (const [label, bytes] of [['valid MP4', validMp4], ['valid MOV', validMov]]) {
+      const inf = await inspect(new BufferSource(bytes));
+      const wr = await writeTags(new BufferSource(bytes), { title: 'Valid' });
+      check(`M3 ${label}: inspect() safeToWrite=true & capabilities.supported has 18 fields & writeTags() succeeds`,
+        inf.format === 'mp4' && inf.safeToWrite === true && inf.mp4.safeToWrite === true
+        && inf.capabilities.supported.length === 18 && wr.ok === true,
+        JSON.stringify({ safe: inf.safeToWrite, ok: wr.ok }));
+    }
+  }
+
+  // ---- M4 (P2-1): inspect() existingTags reading on JPEG & PNG + round-trip & mergeXmp ----
+  {
+    const initialTags = {
+      title: 'Original Title',
+      artist: 'Original Artist',
+      description: 'Original Description',
+      url: 'https://example.com/orig',
+      copyright: '© 2025 Original',
+      keywords: ['k1', 'k2'],
+      date: '2025-10-01T12:00:00Z',
+      software: 'CameraApp 1.0',
+      album: 'Orig Album',
+      genre: 'Portrait',
+      make: 'Canon',
+      model: 'EOS R5',
+      rating: 5,
+    };
+
+    for (const [label, baseBytes] of [
+      ['JPEG', F.buildJpeg().bytes],
+      ['PNG', F.buildPng().bytes],
+    ]) {
+      const w1 = await writeTags(new BufferSource(baseBytes), initialTags);
+      const tagged1 = await bytesOf(w1);
+      const info1 = await inspect(new BufferSource(tagged1));
+      const ex = info1.existingTags;
+      check(`M4 ${label} inspect(): reads back existingTags (title, artist, description, url, copyright, keywords, album, genre, make, model, rating)`,
+        !!ex && ex.title === initialTags.title && ex.artist === initialTags.artist
+        && ex.description === initialTags.description && ex.url === initialTags.url
+        && ex.copyright === initialTags.copyright
+        && JSON.stringify(ex.keywords) === JSON.stringify(initialTags.keywords)
+        && ex.album === initialTags.album && ex.genre === initialTags.genre
+        && ex.make === initialTags.make && ex.model === initialTags.model
+        && ex.rating === initialTags.rating,
+        JSON.stringify(ex));
+
+      // Round-trip via { ...info.existingTags, artist: "Updated Artist" } preserves all other fields
+      const wRoundTrip = await writeTags(new BufferSource(tagged1), { ...info1.existingTags, artist: 'Updated Artist' });
+      const infoRT = await inspect(new BufferSource(await bytesOf(wRoundTrip)));
+      check(`M4 ${label} round-trip via inspect().existingTags: updates artist and preserves title/keywords/copyright`,
+        infoRT.existingTags?.artist === 'Updated Artist'
+        && infoRT.existingTags?.title === initialTags.title
+        && JSON.stringify(infoRT.existingTags?.keywords) === JSON.stringify(initialTags.keywords)
+        && infoRT.existingTags?.copyright === initialTags.copyright,
+        JSON.stringify(infoRT.existingTags));
+
+      // Automatic merge via { mergeXmp: true } preserves existing XMP fields without manual spread
+      const wMerge = await writeTags(new BufferSource(tagged1), { artist: 'Merged Artist' }, { mergeXmp: true });
+      const infoMerge = await inspect(new BufferSource(await bytesOf(wMerge)));
+      check(`M4 ${label} writeTags(..., { mergeXmp: true }): preserves existing XMP fields and updates artist`,
+        infoMerge.existingTags?.artist === 'Merged Artist'
+        && infoMerge.existingTags?.title === initialTags.title
+        && JSON.stringify(infoMerge.existingTags?.keywords) === JSON.stringify(initialTags.keywords)
+        && infoMerge.existingTags?.album === initialTags.album,
+        JSON.stringify(infoMerge.existingTags));
+    }
+  }
+
+  // ---- M5 (round-trip idempotency): description/comment must not duplicate ----
+  // Regression: parseXmpPacket used to map dc:description to BOTH description and
+  // comment, while buildXmpPacket re-joins [description, comment, url] into
+  // dc:description -> every inspect() -> writeTags() round-trip doubled the text.
+  {
+    const cases = [
+      ['description only', { description: 'Only Description' }],
+      ['comment only', { comment: 'Only Comment' }],
+      ['description + comment', { description: 'Desc Body', comment: 'Comment Body' }],
+      ['description + comment + url', { description: 'Desc Body', comment: 'Comment Body', url: 'https://example.com/rt' }],
+    ];
+    for (const [label, baseBytes] of [
+      ['JPEG', F.buildJpeg().bytes],
+      ['PNG', F.buildPng().bytes],
+    ]) {
+      for (const [caseName, tags] of cases) {
+        const b1 = await bytesOf(await writeTags(new BufferSource(baseBytes), tags));
+        const i1 = await inspect(new BufferSource(b1));
+        if (caseName === 'description only') {
+          check(`M5 ${label} ${caseName}: inspect() does not fabricate a comment from dc:description`,
+            i1.existingTags?.comment === undefined, JSON.stringify(i1.existingTags));
+        }
+        const b2 = await bytesOf(await writeTags(new BufferSource(b1), { ...i1.existingTags }));
+        const i2 = await inspect(new BufferSource(b2));
+        const b3 = await bytesOf(await writeTags(new BufferSource(b2), { ...i2.existingTags }));
+        const i3 = await inspect(new BufferSource(b3));
+        check(`M5 ${label} ${caseName}: round-trip is stable (no description/comment growth)`,
+          JSON.stringify(i2.existingTags) === JSON.stringify(i3.existingTags),
+          `${JSON.stringify(i2.existingTags)} vs ${JSON.stringify(i3.existingTags)}`);
+      }
+    }
+  }
+
+  // ---- M5 MP4: comment/url round-trip must not re-append the URL ----
+  // Regression: buildMdirEntries/buildMdtaEntries join [comment, 'URL: ' + url]
+  // into the comment atom; normalizeMp4ExistingTags used to return it verbatim,
+  // so the URL was appended again on every round-trip.
+  {
+    for (const style of ['mdir', 'mdta']) {
+      const base = F.buildMp4({ layout: 'head', existing: style }).bytes;
+      const tags = { description: 'Desc Body', comment: 'Comment Body', url: 'https://example.com/rt' };
+      const b1 = await bytesOf(await writeTags(new BufferSource(base), tags));
+      const i1 = await inspect(new BufferSource(b1));
+      const b2 = await bytesOf(await writeTags(new BufferSource(b1), { ...i1.existingTags }));
+      const i2 = await inspect(new BufferSource(b2));
+      const b3 = await bytesOf(await writeTags(new BufferSource(b2), { ...i2.existingTags }));
+      const i3 = await inspect(new BufferSource(b3));
+      check(`M5 MP4 ${style}: comment/url round-trip is stable (URL not re-appended)`,
+        JSON.stringify(i2.existingTags) === JSON.stringify(i3.existingTags),
+        `${JSON.stringify(i2.existingTags)} vs ${JSON.stringify(i3.existingTags)}`);
+    }
+  }
+}
+
+/* ===================================================================== */
+console.log(`\n\x1b[1m${FAIL === 0 ? '\x1b[32mALL PASSED' : '\x1b[31mSOME FAILED'}\x1b[0m  ${PASS} passed, ${FAIL} failed, ${SKIP} skipped\n`);
 process.exit(FAIL === 0 ? 0 : 1);

@@ -1,13 +1,20 @@
 {
   "name": "@asinnn/stamp-js",
-  "version": "0.1.1",
-  "description": "Low-memory media metadata writer: writes XMP / iTunes tags into JPEG, PNG, and MP4/MOV without re-muxing or re-encoding.",
+  "version": "0.1.2",
+  "description": "Low-memory media metadata writer: writes XMP / EXIF / iTunes / QuickTime tags into JPEG, PNG, and MP4/MOV without re-muxing or re-encoding.",
   "type": "module",
   "main": "./src/stamp.js",
   "module": "./src/stamp.js",
+  "types": "./src/stamp.d.ts",
   "exports": {
-    ".": "./src/stamp.js",
-    "./node": "./src/node.js",
+    ".": {
+      "types": "./src/stamp.d.ts",
+      "default": "./src/stamp.js"
+    },
+    "./node": {
+      "types": "./src/node.d.ts",
+      "default": "./src/node.js"
+    },
     "./src/*": "./src/*"
   },
   "unpkg": "./dist/stamp.umd.js",

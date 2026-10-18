@@ -118,11 +118,7 @@ This creates a circular dependency:
 upgrade stco -> co64  →  moov grows  →  Δ grows  →  more offsets overflow  →  more upgrades
 ```
 
-Because Δ grows monotonically with the number of upgrades, iterating from
-`growth = 0` converges: each pass can only mark *more* boxes for upgrade,
-never fewer. `planStcoUpgrade()` performs this iteration (bounded to 64
-passes), then `rewriteMoov()` rebuilds the moov once with the final Δ,
-upgrading exactly the boxes that overflow and shifting all offsets.
+Because upgrading an `stco` box with an odd entry count adds `4 (mod 8)` bytes, `co64` growth and the `free` box padding required to maintain the project's 8-byte shift alignment invariant (`finalDelta % 8 === 0`) interact with each other. `planAlignedMoovGrowth()` jointly solves for `rawMetaGrowth`, `co64Growth`, and `padBytes` (`0` or `>= 8` bytes) in a monotonically non-decreasing fixed-point iteration (bounded to 64 passes), then `rewriteMoov()` rebuilds the moov once with `finalDelta`. (Note: ISO-BMFF does not mandate 8-byte media chunk offset alignment; the 8-byte shift alignment is a project-defined invariant.)
 Container sizes are recalculated bottom-up during the rebuild.
 
 Key properties:
@@ -299,7 +295,7 @@ a stored tag from a dropped one.
 | Field | JPEG / PNG (XMP) | MP4 / MOV |
 |---|---|---|
 | title, artist, date, comment, url, software, copyright | ✅ | ✅ (`©nam`/`©ART`/`©day`/`©cmt`/`©too`/`cprt`, or the mdta keys `title`/`artist`/`date`/`comment`/`software`/`copyright`) |
-| keywords | ✅ `dc:subject` | ❌ refused — no standard MP4 tag; writing it somewhere invented would be a lie |
+| keywords, encodedDate, taggedDate, dateOriginal, description, album, genre, make, model, gps, rating | ✅ (XMP + EXIF/iTXt/eXIf) | ✅ (`©key`/`keywords`, `mvhd`/`tkhd`/`mdhd` timestamps, `desc`, `©alb`, `©gen`, `©mak`, `©mod`, `©xyz`, `rate`) |
 
 `copyright` uses `cprt` for `mdir` and the `copyright` key for `mdta`; both are
 resolved by exiftool (`ItemList:Copyright` / `Keys:Copyright`). The plausible
@@ -329,7 +325,7 @@ byte insertions. This list can be materialized two ways:
 | udta whose child chain does not tile its range | **Refuse** (rewriting it would drop the bytes after the bad box) |
 | `moov/meta` (Android/MediaTek) | Update in place, keep its QuickTime/ISO layout |
 | Mixed mdir + mdta containers | Update each in its own format (never merge) |
-| Field the container cannot store (MP4 `keywords`) | **Refuse**, name it in `unsupportedTags` |
+| Invalid date value (`new Date(NaN)`, unparseable string, impossible calendar date) | **Refuse** with `BAD_OPTION` before format dispatch |
 | udta without a meta box | Leave byte-identical (refuse if it holds ©tag atoms) |
 | Malformed metadata tree | **Refuse** (never rewrite a partly understood tree) |
 | mdta freeform (`----`) entries | Preserve (never dropped) |
@@ -364,7 +360,7 @@ patches the neighbour", which is how the `stco`/`co64` count-overflow bug was
 found (`findInconsistentOffsetTable()` now refuses such tables up front).
 
 
-- **Unit tests** (`test/run.mjs`, 340 assertions): correctness, safety,
+- **Unit tests** (`test/run.mjs`, 486 assertions on Node 18 / 493 on Node 20/22): correctness, safety,
   idempotency, memory, MPF rebasing, Extended XMP cleanup and input validation.
   Uses hand-crafted ISO-BMFF/JPEG/PNG fixtures with canary bytes, so sample data
   integrity after offset shifts is verified by reading the data back through the

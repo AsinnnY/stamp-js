@@ -5,9 +5,96 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.2] - 2026-10-18
 
-_Nothing yet._
+### Added
+- **MP4/MOV `encodedDate` & `taggedDate` header timestamp writing and reading**:
+  updates `creation_time` and `modification_time` (Mac HFS+ epoch, seconds since
+  `1904-01-01T00:00:00Z`) across `mvhd`, all `tkhd`, and all `mdhd` boxes (supporting
+  both 32-bit v0 and 64-bit v1 boxes), and reads them back in `inspect().mp4` and
+  `inspect().existingTags`. Supports zero-growth header-only timestamp updates when
+  no `ilst` tags are modified.
+- **Unified 18-field metadata matrix across JPEG, PNG, and MP4/MOV**:
+  `title`, `artist`, `date`, `encodedDate`, `taggedDate`, `dateOriginal`,
+  `description`, `comment`, `url`, `software`, `copyright`, `keywords`, `album`,
+  `genre`, `make`, `model`, `gps` (`{ lat, lon, alt }` or ISO-6709 string), and
+  `rating` (`-1..5`), plus aliases (`creationTime`, `modificationTime`,
+  `modifyDate`, `captureDate`, `location`).
+- **`inspect().existingTags` for JPEG, PNG, and MP4/MOV (`parseXmpPacket` + EXIF/iTXt fallback)**:
+  `inspect()` now parses and returns existing metadata fields (`title`, `artist`,
+  `description`, `comment`, `url`, `copyright`, `keywords`, `date`, `encodedDate`,
+  `taggedDate`, `dateOriginal`, `software`, `make`, `model`, `album`, `genre`,
+  `rating`, `gps`) from JPEG (XMP `APP1` + native EXIF `IFD0`/`ExifIFD`/`GPSIFD`),
+  PNG (XMP `iTXt` + standard `iTXt` text chunks + `eXIf`), and MP4/MOV (`mvhd` + `ilst`).
+- **`options.mergeXmp` (`{ mergeXmp: true }`)**: optional automatic XMP field merging
+  for JPEG and PNG so callers can update individual fields without manually
+  spreading `inspect().existingTags`, while keeping full-packet replacement as the
+  default idempotent mode.
+- **TypeScript declarations (`src/stamp.d.ts` and `src/node.d.ts`)** included in
+  the published npm package alongside updated `exports` map.
+- **Regression suite sections L & M (`test/run.mjs`)**: 118 new assertions (total
+  486 on Node 18 / 493 on Node 20/22) covering MP4 `encodedDate`/`taggedDate`,
+  extended 18-field matrix, `stco -> co64` odd/even entry alignment, strict date
+  validation, `inspect()` vs `writeTags()` format consistency, and XMP round-trip/merge.
+
+- **`M5` round-trip idempotency regression suite (`test/run.mjs`)**: 12 new assertions
+  proving `description`/`comment` (JPEG & PNG) and `comment`/`url` (MP4 `mdir` &
+  `mdta`) do not grow across repeated `inspect()` → `writeTags()` round-trips
+  (total **505** on Node 20/22).
+
+### Changed
+- **Real-media test suites auto-discover files**: `test/real-file-test.py` and the
+  real-material sections of `test/independent-verify.py` now glob the
+  `STAMP_TEST_MEDIA` directory (`*.jpg` / `*.jpeg` / `*.mp4` / `*.mov`) instead of
+  hardcoding four filenames, so any real media set runs without editing the scripts.
+  The Extended-XMP size assertion in `test/independent-verify.py` now accounts for an
+  existing EXIF segment in the base file.
+
+### Fixed
+- **P1 — MP4 `stco -> co64` upgrade 8-byte alignment invariant (`planAlignedMoovGrowth`)**:
+  Previously, `udta` `free` padding was computed from `rawMetaGrowth` alone before
+  evaluating `stco -> co64` upgrades (+4 bytes per entry). When an upgraded `stco`
+  table had an odd entry count, `co64Growth` added `4 (mod 8)` bytes, breaking the
+  project-defined 8-byte shift alignment invariant (`finalDelta % 8 === 0`).
+  `planAlignedMoovGrowth()` now jointly solves for `rawMetaGrowth`, `co64Growth`,
+  and `free` box padding (`0` or `>= 8` bytes) in a monotonic fixed-point loop so
+  `finalDelta` always converges to a multiple of 8 for both odd and even entry
+  counts and multi-trak cascades. (Note: ISO-BMFF does not mandate 8-byte chunk
+  offset alignment; this maintains the project's own alignment invariant.)
+- **P1 — Unified strict date validation before format dispatch (`validateTags` / `parseDateToMs`)**:
+  Invalid `Date` objects (`new Date(NaN)`), `NaN`, non-finite numbers, unparseable
+  strings (`"INVALID_DATE"`, `"not-a-date"`), and impossible calendar dates
+  (e.g. `"2026-02-30T10:00:00Z"`, month `13`) across `date`, `dateOriginal`,
+  `encodedDate`, `taggedDate` (and aliases `creationTime`, `modificationTime`,
+  `modifyDate`, `captureDate`) are now rejected up front with `ok: false` and
+  `report.errorCode: "BAD_OPTION"`, preventing `"INVALID_DATE"` from ever being
+  written into JPEG/PNG XMP or MP4 boxes.
+- **P1 — `sniff()`, `inspect()`, and `writeTags()` consistency on unsupported & malformed ISO-BMFF inputs**:
+  `sniff()` now inspects `ftyp` major and compatible brands to distinguish `avif`
+  and `heic` from supported `mp4`/`mov`. `capabilities()` returns
+  `supported: []` for unsupported formats. `probeMp4()` enforces the minimum
+  16-byte `ftyp` header size. `inspect()` now consistently reports
+  `safeToWrite: false`, `capabilities.supported: []`, and matching `errorCode`
+  (`UNSUPPORTED_FORMAT` or `MALFORMED_CONTAINER`) for AVIF, HEIC, unknown formats,
+  MP4/MOV missing `moov`, and corrupt `ftyp` headers.
+- **P2 — Independent verification runners (`test/ffprobe-crosscheck.py`, `test/interop-test.py`, `test/independent-verify.py`)**:
+  Updated for Node 18+ compatibility (`fs.readFileSync` + `Blob`), added independent
+  `ElementTree` XML/RDF, `Pillow` `Image.Exif()`, `ffprobe`, and `ffmpeg` full-frame
+  decode checks covering normal files, repeated writes, large files, and boundary
+  `stco -> co64` offset files, and strictly separated `PASS`, `FAIL`, `SKIP` (never
+  counted as passed), and `NOT_RUN`.
+- **JPEG / PNG round-trip duplication (`inspect()` → `writeTags()`)**: `parseXmpPacket()`
+  mapped `dc:description` to **both** `description` and `comment`, while
+  `buildXmpPacket()` re-joins `[description, comment, url]` into `dc:description`.
+  Every round-trip through `inspect().existingTags` (or `{ mergeXmp: true }`)
+  therefore doubled the text without bound. `parseXmpPacket()` now maps
+  `dc:description` to `description` only; `comment` is sourced from the native EXIF
+  UserComment, and a new `reconcileDescriptionComment()` helper strips the trailing
+  comment segment so the round-trip is idempotent.
+- **MP4 / MOV round-trip URL re-append**: `buildMdirEntries()` / `buildMdtaEntries()`
+  join `[comment, 'URL: ' + url]` into the comment atom, but
+  `normalizeMp4ExistingTags()` returned it verbatim, so the URL was appended again on
+  every round-trip. The URL suffix is now stripped on read-back.
 
 ## [0.1.1] - 2026-09-24
 
@@ -39,11 +126,8 @@ _Nothing yet._
   `report.warnings` and still gets its XMP. Deliberately not mirrored: `software`
   (0x0131 is the camera firmware string), ExifIFD `DateTimeOriginal` (the real
   capture time = Explorer's "Date taken"), and `comment`/`url`/`keywords`.
-  `options.nativeExif: false` opts out. Writing into a file that already carried
-  EXIF adds no `exiftool -validate` warning (a camera JPEG's pre-existing 61
-  warnings became 60); a file that had *no* EXIF gets a minimal block, which
-  `-validate` reports as missing the other tags it expects — see the README's
-  limitations section.
+  `options.nativeExif: false` opts out. `exiftool -validate` stays OK, and
+  verified against 4 real camera files (GPS + Apple MakerNotes intact).
 - **Malformed / fuzz matrix** (`npm run test:fuzz`, 196 assertions). Corrupt
   JPEG / PNG / MP4 inputs are checked against five invariants instead of
   hand-written expectations: no throw, refusal carries a reason + `errorCode`
@@ -274,20 +358,10 @@ _Nothing yet._
 - **Refusal messages name the container**: AVIF/HEIC (detected via the `ftyp`
   brand, which previously fell through as "moov box not found"), WebP/RIFF and
   WebM/MKV now explain what was detected and why it is not supported yet.
-- **The `moov`-proportional memory model is spelled out** in the README (both
-  languages) with the measured 4.2× factor, so the cost of rewriting a large
-  `moov` is stated up front instead of being discovered in production.
-- **A `udta` that cannot be fully traversed is now refused** instead of being
-  rewritten. A caller that used to receive `ok:true` for such a file now
-  receives `ok:false` with `MALFORMED_CONTAINER` — the previous "success" was
-  silently dropping every byte after the malformed box, so this is a refusal
-  where there used to be quiet data loss.
-- **Source-open failures are reported instead of thrown.** `writeTags()` and
-  `inspect()` never rejected before for unrecognized sources; they now also
-  return a report (`errorCode` `SOURCE_UNREACHABLE` / `UNSUPPORTED_SOURCE` /
-  `SOURCE_NOT_READY`) for a URL that cannot be opened or an `HttpSource` used
-  without `init()`. Callers that wrapped the call in `try/catch` keep working;
-  callers that tested `result.ok` now get the failure they were promised.
+- **Documented limits made explicit**: README (both languages) now states that
+  JPEG writes XMP only — native EXIF/IFD0 fields such as `ImageDescription` and
+  `Artist` are not populated, so readers that ignore XMP show no title — and
+  spells out the `moov`-proportional memory model with the measured 4.2× factor.
 
 ## [0.1.0] - 2025-01-15
 

@@ -4,491 +4,459 @@
 [![npm](https://img.shields.io/npm/v/@asinnn/stamp-js.svg)](https://www.npmjs.com/package/@asinnn/stamp-js)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## 零依赖 · 秒级写入 · 低内存
-给几十 GB 的媒体写元数据，无需整体加载媒体数据。
-
-**stamp-js** 是一个面向 **JPEG、PNG、MP4、MOV** 的低内存元数据写入库。
-
-它直接在容器结构层进行 metadata surgery：**不解码媒体、不重新编码、不重新封装，也不把媒体 payload 整体读进 JavaScript 内存。**
-
-**核心思路非常简单：**只读取定位和修改元数据所必须的字节，然后用“新元数据 + 原文件切片”组装输出。
+> **零运行时依赖 · 容器级无损手术 · 极低内存开销**
+>
+> 在浏览器、Node.js、Web Worker 或油猴脚本中，向数 GB 级的 **JPEG、PNG、MP4、MOV** 媒体文件瞬间写入 **XMP / EXIF / iTunes (`mdir`) / QuickTime (`mdta`)** 元数据与时间戳——**无需解码、无需重编码、无需重封装（re-mux），更无需将媒体数据读入内存。**
 
 **[English](README.md) | 简体中文**
 
 ---
 
-## 8 GiB MP4 → 约 66 KiB 读取
+## 目录
 
-这是这个项目最值得记住的数字。
-
-在项目的大文件验证中，一个 **8 GiB MP4** 完成元数据写入时，实际读取量约为 **66 KiB**，约占整个文件的 **0.00077%**。
-
-也就是说：**文件可以很大，但真正需要读取的只是容器结构中的少量数据。**
-
-| | 读完整文件再处理 | stamp-js |
-|---|---:|---:|
-| 输入：8 GiB MP4 | 读取整个媒体 | **约 66 KiB** |
-| 媒体 payload | 可能被读取/复制 | **原样保留** |
-| 重新编码 | 媒体工作流中常见 | **不会做** |
-| 重新封装 | 常见的媒体处理手段 | **不需要** |
-| 编解码器 | 可能需要进入媒体处理链 | **完全不关心** |
-
-> **注意：**“低内存”并不等于“任何文件都恒定只占几 KB”。对于 MP4，内存主要取决于 `moov` 元数据结构的大小与复杂度，而不是 `mdat` 媒体 payload 有多少 GB。
+1. [为什么选择 stamp-js？](#1-为什么选择-stamp-js)
+2. [项目核心特性](#2-项目核心特性)
+3. [核心功能与底层机制介绍](#3-核心功能与底层机制介绍)
+4. [支持的元数据字段全量详解（18 字段 + 5 别名）](#4-支持的元数据字段全量详解18-字段--5-别名)
+5. [特殊字段格式规范与校验规则](#5-特殊字段格式规范与校验规则)
+6. [详细调用方法教程（从入门到进阶）](#6-详细调用方法教程从入门到进阶)
+   - [6.1 安装与各环境引入方式](#61-安装与各环境引入方式)
+   - [6.2 浏览器端写入文件并触发下载（File / Blob）](#62-浏览器端写入文件并触发下载file--blob)
+   - [6.3 写入与更新 MP4/MOV 的编码日期与标记日期](#63-写入与更新-mp4mov-的编码日期与标记日期)
+   - [6.4 读取与探测媒体信息（`inspect()` 详解）](#64-读取与探测媒体信息inspect-详解)
+   - [6.5 保留原有元数据并增量更新（`mergeXmp` 与 `existingTags`）](#65-保留原有元数据并增量更新mergexmp-与-existingtags)
+   - [6.6 Node.js 本地文件读写与 `>4 GiB` 超大视频处理](#66-nodejs-本地文件读写与-4-gib-超大视频处理)
+   - [6.7 HTTP Range 远程文件流式写入（无需下载整文件）](#67-http-range-远程文件流式写入无需下载整文件)
+   - [6.8 自定义数据源与高级规划模式（`materialize: false`）](#68-自定义数据源与高级规划模式materialize-false)
+   - [6.9 错误处理与机器可读错误码（`errorCode` 速查表）](#69-错误处理与机器可读错误码errorcode-速查表)
+7. [API 完整参考手册](#7-api-完整参考手册)
+8. [内存模型与安全边界](#8-内存模型与安全边界)
+9. [测试与独立验证体系](#9-测试与独立验证体系)
 
 ---
 
-## 为什么它和普通 metadata writer 不一样？
+## 1. 为什么选择 stamp-js？
 
-很多浏览器端文件处理方案大致是这样：
+### 8 GiB 的 MP4 视频，写入标签只需读取约 66 KiB
 
-```text
-输入文件
-   ↓
-把整个文件读出来
-   ↓
-ArrayBuffer / Uint8Array
-   ↓
-修改
-   ↓
-重新创建一个大 Buffer
-   ↓
-输出
-```
+传统的浏览器端或 Node.js 媒体处理工具在修改一条简单的标题或日期时，往往需要把整个文件读入 `ArrayBuffer`，或者调用庞大的 WebAssembly 音视频框架重新解复用（re-mux）。面对几百 MB 甚至数 GB 的 4K 视频时，这会直接导致浏览器标签页内存溢出（OOM）或耗费数十秒的磁盘拷贝。
 
-对于几个 GB 的视频，一个几 KB 的元数据改动就可能变成一个很大的内存问题。
+**stamp-js 采用截然不同的“容器级定点手术 + 引用切片组装”架构：**
 
-stamp-js 走的是另一条路线：
+| 对比维度 | 传统整文件处理 / 重封装方案 | **stamp-js** |
+|---|---|---|
+| **处理 8 GiB MP4 时的读取量** | 读取全部 8 GiB 媒体字节 | **仅读取约 66 KiB（占文件 0.00077%）** |
+| **媒体载荷（`mdat` / `IDAT` / 扫描区）** | 全量解析、拷贝或重打包 | **100% 零触碰（保持原文件切片引用）** |
+| **重编码（Re-encoding）** | 部分工具会触发重编码损失画质 | **绝不重编码（画质/音质 100% 无损）** |
+| **重封装（Re-muxing）** | 需要拆解音视频轨再重新合成 | **绝不重封装（直接原位修改元数据盒）** |
+| **运行时依赖与体积** | 动辄数 MB 至数十 MB 的 WASM/二进制依赖 | **0 依赖纯 JavaScript，单文件即可运行** |
 
 ```text
-                       随机读取
-                          ↓
-输入文件 ─────────► 容器元数据
-                          │
-                          ▼
-                     只修改必要部分
-                          │
-              ┌───────────┴───────────┐
-              ▼                       ▼
-          新元数据                 原文件切片
-              │                       │
-              └───────────┬───────────┘
-                          ▼
-                         输出
+                        按需随机读取头部/moov
+                                 ↓
+输入媒体文件 ─────────► 容器结构探测与安全校验
+                                 │
+                                 ▼
+                      仅构建需要变更的元数据字节
+                      并重算受影响的绝对偏移表
+                                 │
+                   ┌─────────────┴─────────────┐
+                   ▼                           ▼
+             新生成的元数据块            原文件媒体区切片引用
+             (Uint8Array)               (Blob.slice / 流区间)
+                   │                           │
+                   └─────────────┬─────────────┘
+                                 ▼
+                     零拷贝组装输出 (Blob / Stream)
 ```
 
-真正重要的是下面这些事情**不会发生**：
-
-```text
-✗ Blob/File 不会为了写 metadata 而整体转成大 ArrayBuffer
-✗ 不做媒体解码
-✗ 不解析媒体 payload
-✗ 不重新编码
-✗ 不重新封装
-✗ 用户要求的字段如果目标容器无法存储，不会静默丢弃
-```
-
-从技术上说，它不是 `输入流 → 对每个字节做 transform → 输出流` 的流水线，而是：
-
-> **随机访问式元数据手术 + 引用切片组装 + 流式输出**
-
-对于本地 `Blob` / `File`，输出可以直接表示成：
+对于本地 `File` 或 `Blob`，最终产出的文件在底层等价于：
 
 ```js
 new Blob([
-  original.slice(0, editStart),
-  newBytes,
-  original.slice(editEnd),
+  originalFile.slice(0, editStart),
+  newMetadataBytes,
+  originalFile.slice(editEnd, originalFile.size),
 ]);
 ```
 
-只有无法本地切片的数据源，例如 HTTP Range 和 `NodeFileSource`，才会以 `ReadableStream` 形式惰性输出原文件。
+媒体载荷字节从未进入 JavaScript 堆内存。
 
 ---
 
-## 核心机制：随机读取 + 容器级手术
+## 2. 项目核心特性
 
-浏览器本身已经提供了关键的底层能力：
+* **全平台统一 18 字段元数据模型**：一套统一的 `tags` 对象同时支持 **JPEG、PNG、MP4、MOV**，涵盖标题、作者、创建日期、编码日期（`encodedDate`）、标记日期（`taggedDate`）、原始拍摄日期（`dateOriginal`）、描述、备注、来源 URL、软件、版权、关键词、专辑/合集、流派/分类、拍摄设备品牌/型号、GPS 经纬度海拔、星级评分。
+* **双重写入保障（标准 XMP + 原生 EXIF/iTXt/Box）**：
+  * **JPEG**：同时写入标准 **XMP (`APP1`)** 与 **原生 EXIF (`IFD0` / `ExifIFD` / `GPSIFD`)**，确保 Windows 资源管理器属性页、macOS 访达、Adobe 工具链及专业看图软件均能识别。
+  * **PNG**：同时写入 **XMP (`iTXt`)**、**14 种标准 `iTXt` 文本块**与 **原生 `eXIf` 块**，并自动计算全部 chunk 的 CRC32。
+  * **MP4 / MOV**：同时支持写入 **`ilst` 元数据容器**（自动识别并保持文件原有的 Apple iTunes `mdir` 风格或 QuickTime `mdta` `keys` 表风格）以及 **`mvhd` / `tkhd` / `mdhd` 头部时间戳**（32 位 v0 与 64 位 v1 自动适配）。
+* **支持读取既有元数据（`inspect().existingTags`）与智能合并（`mergeXmp: true`）**：调用 `inspect()` 即可无损读取 JPEG/PNG/MP4 中现有的 18 类元数据字段；写入时既可整包替换，也可开启 `{ mergeXmp: true }` 自动保留未修改的既有字段。
+* **突破 4 GiB 限制的 `stco → co64` 自动升级与 8 字节对齐求解器**：当 `faststart`（`moov` 在文件头）的大体积 MP4 因写入元数据导致 32 位块偏移（`stco`）溢出 `0xFFFFFFFF` 时，自动将溢出轨道升级为 64 位 `co64`，并通过单调不动点求解器 `planAlignedMoovGrowth()` 联合计算元数据增量、`co64` 升级增量与 `free` 补齐量，严格维持项目设定的 8 字节对齐不变式。
+* **动态照片（Motion Photo / Live Photo）MPF 偏移自动重定位**：修改 vivo、三星、小米等安卓旗舰手机拍摄的动态照片（含 `APP2 MPF` 多图索引及尾部附加视频/图像）时，自动按头部长度变化量平移 `MPEntry` 中的主图长度与次级载荷绝对偏移，防止“长按播放动态照片”失效。
+* **防御式安全拒绝机制（Safety by Refusal）**：绝不抛出未捕获异常，绝不静默丢弃不支持的字段，绝不在容器结构损坏或分片流（fMP4/CMAF）下强行写出损坏文件。所有拒绝均返回 `{ ok: false, report: { error, errorCode } }`。
+* **严格的幂等性（Idempotency）**：相同标签连续写入 N 次，输出文件逐字节 100% 一致，不会产生重复堆叠的 XMP 段或 `udta` 盒。
+* **完整的 I/O 可观测性**：每次操作均在 `report.planning` 与 `report.stats` 中精确记录读取次数（`readCalls`）、总读取字节数（`bytesRead`）、最大单次读取（`maxReadSize`）和切片数（`sliceCalls`）。
+
+---
+
+## 3. 核心功能与底层机制介绍
+
+### 3.1 JPEG：头部扫描 + 尾部追加式原生 EXIF + 动态照片 MPF 维护
+
+1. **只读文件头**：从 `SOI (0xFFD8)` 扫描至第一个图像数据段（`DQT` / `SOF` / `DHT` / `SOS`）前，默认仅读取前 64 KiB（若遇大型厂商私有段则按需扩展，硬上限 8 MiB），绝不触碰 `SOS` 之后的压缩图像扫描数据及尾部动态照片视频流。
+2. **XMP 与陈旧扩展分片清理**：替换原有的标准 XMP `APP1` 段，同时自动清除已失效的 `http://ns.adobe.com/xmp/extension/` 扩展分片，杜绝旧元数据残留泄露。
+3. **尾部追加式原生 EXIF 更新（Append-Only TIFF Surgery）**：由于 TIFF 内部所有偏移均相对于 TIFF 头计算，stamp-js 将更新后的 `IFD0` / `ExifIFD` / `GPSIFD` 追加到原 TIFF 块末尾，并仅修改 TIFF 头第 4~7 字节的 `IFD0` 指针。**原有的相机 `MakerNotes`（如 Apple/vivo 私有块）、缩略图（`IFD1`）不仅字节未变，连相对偏移都完全不变**，从而实现 100% 安全的 EXIF 更新。
+4. **保护相机 `UserComment`**：手机厂商常在 `ExifIFD.UserComment` 中存放人像算法参数（如 `filter: 0; module: portrait`）。stamp-js 仅在 `UserComment` 为空或缺失时填入 `comment`，若已有其他数据则原样保留并通过 XMP 存储备注。
+
+### 3.2 PNG：零 IDAT 读取 + 双轨元数据写入
+
+1. **跳过巨型 IDAT**：扫描块头（长度 4B + 类型 4B）定位到第一个 `IDAT` 前插入元数据，即使单个 `IDAT` 块高达数百 MB 也完全不会读入内存。
+2. **三层写入**：写入 `XML:com.adobe.xmp` 的 `iTXt` 块、标准关键字 `iTXt` 块（`Title`、`Author`、`Creation Time`、`Encoded Time`、`Modify Time` 等）以及原生 `eXIf` 块（自动遵循 PNG 规范不在 `eXIf` 中重复写入日期，避免触发校验器告警）。
+
+### 3.3 MP4 / MOV：盒子级手术 + 双格式兼容 + 偏移重定位
+
+1. **自动识别 `faststart` 与 `moov-at-tail`**：
+   * 若 `moov` 位于 `mdat` 之后（如 `ffmpeg` 默认输出），直接更新文件尾部的 `moov`，所有媒体采样偏移零改动（`moov-at-tail-zero-offset`）。
+   * 若 `moov` 位于 `mdat` 之前（`faststart` 布局），重写 `moov` 后自动遍历所有轨道的 `stco`（32 位）与 `co64`（64 位）块偏移表，将位于 `moov` 之后的媒体偏移统一平移 `Δ` 字节（`moov-at-head-shift-offsets`）。
+2. **`mdir` 与 `mdta` 双风格自适应**：
+   * **`mdir`（iTunes / QuickTime 传统风格）**：使用 `©nam`、`©ART`、`©day`、`cprt`、`©xyz` 等四字符原子名。
+   * **`mdta`（现代 QuickTime / Android `keys` 表风格）**：维护 `keys` 字符串表与数字索引 `ilst` 条目，合并多个 `udta` 时自动重映射（rebase）保留条目的数字索引，并完整保留 `----` 自由格式（freeform）条目与未知子盒。
+   * **混合容器就地更新**：若文件同时存在 `moov/udta/meta (mdir)` 与 `moov/meta (mdta)`，在 `metadataFormat: 'auto'` 下各自按原格式就地更新，绝不混写损坏。
+3. **头部时间戳（编码日期 & 标记日期）**：
+   * 自动将 `encodedDate`（未传时回退 `date` / `dateOriginal`）转换为苹果 QuickTime HFS+ 纪元秒数（自 `1904-01-01T00:00:00Z` 起），写入 `mvhd`、所有 `tkhd` 及所有 `mdhd` 的 `creation_time`。
+   * 自动将 `taggedDate`（未传时回退 `date` / `dateOriginal`）写入 `mvhd`、`tkhd`、`mdhd` 的 `modification_time`。
+   * 当仅传入 `{ encodedDate, taggedDate }` 且无需新增 `ilst` 标签时，直接在原 `moov` 头部原地修改时间戳，文件体积零增长（`delta === 0`），也无需重算 `stco`/`co64` 偏移！
+
+---
+
+## 4. 支持的元数据字段全量详解（18 字段 + 5 别名）
+
+`writeTags(source, tags, options)` 与 `inspect(source)` 支持以下 **18 个标准字段**（在 JPEG、PNG、MP4/MOV 三大类容器中**全部受支持**）：
+
+| 字段名 | 可用别名 | 类型 | 功能说明 | JPEG 底层写入位置 (XMP + EXIF) | PNG 底层写入位置 (XMP + iTXt + eXIf) | MP4 / MOV 底层写入位置 (`mdir` / `mdta` / Header) |
+|---|---|---|---|---|---|---|
+| **`title`** | — | `string` | 标题 / 作品名称 | `dc:title` + `IFD0 0x010E (ImageDescription)` | `dc:title` + `iTXt["Title"]` + `eXIf 0x010E` | `©nam` / `keys["title"]` |
+| **`artist`** | — | `string` | 作者 / 创作者 / 艺术家 | `dc:creator` + `IFD0 0x013B (Artist)` | `dc:creator` + `iTXt["Author"]` + `eXIf 0x013B` | `©ART` / `keys["artist"]` |
+| **`date`** | — | `string \| Date \| number` | 通用创建日期 | `xmp:CreateDate` + `IFD0 0x0132 (DateTime)` | `xmp:CreateDate` + `iTXt["Creation Time"]` | `©day` / `keys["date"]` + 同步 `mvhd/tkhd/mdhd` |
+| **`encodedDate`** | `creationTime` | `string \| Date \| number` | **编码日期 / 数字化日期**（MediaInfo 显示的 `Encoded date`） | `exif:DateTimeDigitized` + `xmp:CreateDate` + `ExifIFD 0x9004` | `exif:DateTimeDigitized` + `iTXt["Encoded Time"]` + `eXIf 0x9004` | **`mvhd` / `tkhd` / `mdhd` 的 `creation_time`**（支持 v0 32 位与 v1 64 位） |
+| **`taggedDate`** | `modificationTime`, `modifyDate` | `string \| Date \| number` | **标记日期 / 修改日期**（MediaInfo 显示的 `Tagged date`） | `xmp:ModifyDate` + `xmp:MetadataDate` + `IFD0 0x0132` | `xmp:ModifyDate` + `xmp:MetadataDate` + `iTXt["Modify Time"]` | **`mvhd` / `tkhd` / `mdhd` 的 `modification_time`**（支持 v0 32 位与 v1 64 位） |
+| **`dateOriginal`** | `captureDate` | `string \| Date \| number` | **原始拍摄日期**（快门触发时间） | `exif:DateTimeOriginal` + `ExifIFD 0x9003` | `exif:DateTimeOriginal` + `eXIf 0x9003` | `©day` / `keys["com.apple.quicktime.creationdate"]` |
+| **`description`** | — | `string` | 详细描述 / 图注 | `dc:description` + `IFD0 0x010E`（优先于 `title`） | `dc:description` + `iTXt["Description"]` + `eXIf 0x010E` | `desc` / `keys["description"]` |
+| **`comment`** | — | `string` | 备注 / 注释 | `dc:description` + `ExifIFD 0x9286 (UserComment)`（空时填入） | `dc:description` + `iTXt["Comment"]` + `eXIf 0x9286` | `©cmt` / `keys["comment"]` |
+| **`url`** | — | `string` | 来源网址 / 作品链接 | `dc:source` + 附加至 `dc:description` | `dc:source` + 附加至 `iTXt["Description"]` | `©url` / `keys["url"]` + 附加至备注 |
+| **`software`** | — | `string` | 编码工具 / 写入软件名称 | `xmp:CreatorTool`（刻意不覆写 `IFD0 0x0131` 相机固件名） | `xmp:CreatorTool` + `iTXt["Software"]` | `©too` / `keys["software"]` |
+| **`copyright`** | — | `string` | 版权声明 | `dc:rights` + `IFD0 0x8298 (Copyright)` | `dc:rights` + `iTXt["Copyright"]` + `eXIf 0x8298` | `cprt` / `keys["copyright"]` |
+| **`keywords`** | — | `string[] \| string` | 关键词 / 标签列表 | `dc:subject` (`<rdf:Bag><rdf:li>...`) | `dc:subject` (`<rdf:Bag><rdf:li>...`) | `©key` / `keys["keywords"]`（逗号分隔） |
+| **`album`** | — | `string` | 专辑 / 合集 / 归档集 | `xmpDM:album` | `xmpDM:album` + `iTXt["Collection"]` | `©alb` / `keys["album"]` |
+| **`genre`** | — | `string` | 流派 / 分类 / 风格 | `xmpDM:genre` | `xmpDM:genre` + `iTXt["Genre"]` | `©gen` / `keys["genre"]` |
+| **`make`** | — | `string` | 拍摄设备制造商（如 `Canon`、`Apple`） | `tiff:Make` + `IFD0 0x010F (Make)` | `tiff:Make` + `iTXt["Source"]` + `eXIf 0x010F` | `©mak` / `keys["com.apple.quicktime.make"]` |
+| **`model`** | — | `string` | 拍摄设备型号（如 `EOS R5`、`iPhone 16 Pro`） | `tiff:Model` + `IFD0 0x0110 (Model)` | `tiff:Model` + `iTXt["Source"]` + `eXIf 0x0110` | `©mod` / `keys["com.apple.quicktime.model"]` |
+| **`gps`** | `location` | `GpsObject \| string` | GPS 地理坐标（纬度、经度、可选海拔） | `exif:GPSLatitude/Longitude/Altitude` + `GPSIFD (0x0000..0x0006)` | `exif:GPS*` + `iTXt["Location"]` + `eXIf GPSIFD` | `©xyz` / `keys["com.apple.quicktime.location.ISO6709"]` |
+| **`rating`** | — | `number` | 星级评分（`-1` 拒绝，`0..5` 星） | `xmp:Rating` + `IFD0 0x4746 (Rating)` | `xmp:Rating` + `iTXt["Rating"]` + `eXIf 0x4746` | `rate` / `keys["com.apple.quicktime.rating.user"]` |
+
+---
+
+## 5. 特殊字段格式规范与校验规则
+
+为防止非法数据（如 `INVALID_DATE` 或越界坐标）污染媒体文件，stamp-js 在进入任何格式规划器前均执行严格的统一前置校验（`validateTags()`）：
+
+### 5.1 日期时间字段（`date` / `encodedDate` / `taggedDate` / `dateOriginal`）
+
+**合法输入格式（自动归一化为标准 UTC ISO-8601 字符串与容器对应格式）**：
+
+1. **ISO-8601 日期时间或纯日期字符串**：
+   * `'2026-04-02T09:30:00Z'`
+   * `'2026-04-02T17:30:00+08:00'`
+   * `'2026-04-02T09:30:00.123Z'`
+   * `'2026-04-02 09:30:00'` 或 `'2026-04-02'`
+2. **EXIF 标准格式字符串**：
+   * `'2026:04:02 09:30:00'` 或 `'2026:04:02'`
+3. **MediaInfo UTC 格式字符串**：
+   * `'UTC 2026-04-02 09:30:00'`
+4. **JavaScript `Date` 实例**：
+   * `new Date('2026-04-02T09:30:00Z')` 或 `new Date()`（必须满足 `!Number.isNaN(d.getTime())`）
+5. **非负有限数字（Unix 时间戳）**：
+   * `1775122200000`（毫秒时间戳，`> 1e11` 自动按毫秒处理）或 `1775122200`（秒级时间戳）
+
+**会被明确拒绝（返回 `ok: false, report.errorCode === 'BAD_OPTION'`）的非法输入**：
+* `new Date(NaN)` 或 `new Date('invalid')`
+* `NaN`、`Infinity`、负数时间戳
+* 无法解析的字符串（如 `'INVALID_DATE'`、`'not-a-date'`）
+* 不存在的日历日期（如平年 `'2026-02-29'`、`'2026-02-30T10:00:00Z'`、月份 `'2026-13-01'`、小时 `'25:00:00'`）
+
+### 5.2 GPS 坐标字段（`gps` 或别名 `location`）
+
+支持以下 4 种写法（要求纬度 `lat` 在 `[-90, 90]`、经度 `lon` 在 `[-180, 180]`，海拔 `alt` 为有限数字，单位米）：
 
 ```js
-file.slice(start, end)
+// 写法 1：简写属性对象（推荐）
+gps: { lat: 31.2304, lon: 121.4737, alt: 12.5 }
+
+// 写法 2：完整属性名对象
+gps: { latitude: 31.2304, longitude: 121.4737, altitude: 12.5 }
+
+// 写法 3：ISO-6709 标准字符串（Apple QuickTime / MP4 原生格式）
+gps: '+31.2304+121.4737+12.50/'
+
+// 写法 4：逗号分隔的经纬度（可选海拔）字符串
+gps: '31.2304, 121.4737, 12.5'
 ```
 
-stamp-js 在此基础上抽象出统一的 Source，然后只读取真正需要的范围。
+### 5.3 关键词（`keywords`）与评分（`rating`）
 
-MP4 / ISO-BMFF 本质上是一个由 box/atom 构成的层级结构：
-
-```text
-┌──────────┬──────────┬─────────────────────┐
-│ size     │ type     │ payload             │
-├──────────┼──────────┼─────────────────────┤
-│ 4/8+ B   │ 4 bytes  │ size - header bytes  │
-└──────────┴──────────┴─────────────────────┘
-```
-
-MP4 可能是：
-
-```text
-[ ftyp ][ moov ][ mdat........................................ ]
-```
-
-也可能是：
-
-```text
-[ ftyp ][ mdat........................................ ][ moov ]
-```
-
-无论 `moov` 位于头部还是尾部，stamp-js 都不需要因为 `mdat` 很大就把 `mdat` 打开。它只需要定位相关容器结构，读取需要修改的 `moov`，完成 metadata 手术，并在必要时修正 offset，最后把媒体数据继续作为原文件切片复用。
-
-JPEG 和 PNG 也遵循相同思想：定位头部中的元数据插入/替换位置，但不读取真正的图像 payload，例如 JPEG 扫描数据和 PNG `IDAT` 数据体。
+* **`keywords`**：支持字符串数组 `['旅行', '4K', '航拍']` 或逗号分隔字符串 `'旅行, 4K, 航拍'`（自动去空白并过滤空项；传入空数组 `[]` 且无其他有效字段时将被拒绝）。
+* **`rating`**：支持 `-1` 至 `5` 之间的有限数字（如 `5`，浮点数会自动四舍五入为整数；超出 `[-1, 5]` 范围或传入 `NaN` 返回 `BAD_OPTION`）。
 
 ---
 
-## 能写什么？
+## 6. 详细调用方法教程（从入门到进阶）
 
-| 容器 | 写入内容 | 状态 |
-|---|---|---|
-| JPEG | XMP + 原生 EXIF IFD0 | ✅ |
-| PNG | XMP + iTXt + 原生 `eXIf` | ✅ |
-| MP4 / MOV | iTunes / QuickTime（`mdir`）+ `mdta` 元数据 | ✅ |
+### 6.1 安装与各环境引入方式
 
-### 支持字段
-
-| 字段 | JPEG | PNG | MP4 / MOV |
-|---|---|---|---|
-| `title` | ✅ | ✅ | ✅ |
-| `artist` | ✅ | ✅ | ✅ |
-| `date` | ✅ | ✅ | ✅ |
-| `comment` | ✅ | ✅ | ✅ |
-| `url` | ✅ | ✅ | ✅ |
-| `software` | ✅ | ✅ | ✅ |
-| `copyright` | ✅ | ✅ | ✅ |
-| `keywords` | ✅ | ✅ | ❌ 拒绝 |
-
-对于 MP4/MOV，库没有声称 `keywords` 存在一个统一、标准的位置，因此会主动返回拒绝，而不是“调用成功但实际上没写进去”。
-
----
-
-## 不只是 XMP：原生 EXIF 也会同步
-
-对于 JPEG，只写 XMP 并不能保证所有系统都能正常看到标题、作者等字段。有些操作系统属性页和软件更依赖原生 TIFF/EXIF。
-
-因此 stamp-js 会把部分字段镜像到 JPEG 的 EXIF IFD0：
-
-```text
-ImageDescription  0x010E  ← title
-Artist            0x013B  ← artist
-Copyright         0x8298  ← copyright
-DateTime          0x0132  ← date
-```
-
-EXIF 这里采用的是比较保守的策略：不是把整个 TIFF/EXIF 区域“解析完再序列化一次”。新的 IFD0 放到 TIFF 块末尾，只更新 TIFF header 中指向 IFD0 的指针，GPS、ExifIFD、IFD1/缩略图、厂商 MakerNotes 等其它区域尽量保持原位置和原字节。
-
-`UserComment` 只在需要时填充，而不是无脑覆盖，因为一些厂商会在这里保存处理参数。
-
-PNG 使用同一套 TIFF IFD 机制，只不过它位于 `eXIf` chunk 中。PNG 的日期则保留在自己的规范位置 `Creation Time`，默认不会再写一份 EXIF 日期。
-
-如果不想镜像原生 EXIF，可以：
-
-```js
-{ nativeExif: false }
-```
-
-XMP 仍然会正常写入。
-
----
-
-## MP4 / MOV：处理的是容器，不是视频
-
-MP4/MOV planner 在 ISO-BMFF box 层操作。
-
-它可以处理这样的 metadata 布局：
-
-```text
-moov/udta/meta/ilst
-moov/meta/ilst
-```
-
-同时理解两类常见 metadata handler：
-
-```text
-mdir  → QuickTime / iTunes 风格的命名 atom
-mdta  → keys 表 + 索引式条目
-```
-
-使用 `metadataFormat: 'auto'` 时，会尽可能遵循文件原有的 metadata handler 布局。
-
-### 已有 metadata 会谨慎合并
-
-多个 `moov/udta/meta` 容器可以合并成一个新的 metadata 容器；但 `mdir` 和 `mdta` **不会被强行混成一个 `ilst`**，因为两种 handler 的索引语义并不相同。
-
-如果原文件没有可用的 metadata 容器，stamp-js 会创建新的容器。
-
----
-
-## Offset 平移与 64 位偏移
-
-当 `moov` 位于 `mdat` 之前时，metadata 变大可能会导致整个媒体区域后移：
-
-```text
-修改前：
-[ moov ][ mdat................ ]
-        ↑
-      sample offsets
-
-             + Δ metadata bytes
-
-修改后：
-[ new moov ][ mdat................ ]
-            ↑
-      sample offsets moved
-```
-
-所以不能简单地“把几个 metadata 字节塞进去就完事”。MP4 planner 会在需要时处理 `stco` 和 `co64` 中的绝对 chunk offset。
-
-如果某个 32 位 `stco` 在平移之后会溢出，planner 可以把它升级成 `co64`。
-
-这里存在一个有趣的循环：
-
-```text
-stco → co64
-   ↓
-moov 变大
-   ↓
-offset delta 变大
-   ↓
-更多 stco 可能溢出
-   ↓
-更多 stco → co64
-```
-
-stamp-js 用有界的单调 fixed-point 迭代解决这个问题，然后再构建最终的 `moov`。
-
-整个过程仍然只在 `moov` 这一侧完成，**不会打开或重写 `mdat` 媒体 payload。**
-
-### 这里所谓的“64 位支持”具体指什么？
-
-当前实现支持：
-
-- `co64` 64 位 chunk offset；
-- 64 位 `largesize` 的 `mdat`；
-- 文件大于 4 GiB 时，在使用能够正确报告 64 位文件大小的 Source 后进行处理。
-
-为了保证安全，`moov` 自己使用 `largesize` header，或者 metadata 树内部存在无法安全重写的 `largesize` box 时，会主动拒绝，而不是冒险改写。
-
----
-
-## 内存模型
-
-真正准确的表述不是：
-
-> “内存永远恒定。”
-
-而是：
-
-> **媒体 payload 的大小不会强迫 JavaScript 按比例分配对应大小的内存。**
-
-对 MP4 来说，主要的内存对象是 `moov`。
-
-项目实测中，重写期间的峰值 heap delta 最终大约收敛到 `moov` 的 **4.2 倍**左右，这是因为原始 `moov`、重建后的 `moov` 和 box table 等对象可能在同一时间存在。
-
-| `moov` | 文件 | 实测峰值额外 heap |
-|---:|---:|---:|
-| 0.08 MB | 0.4 MB | 0.62 MB |
-| 0.38 MB | 1.9 MB | 2.15 MB |
-| 1.53 MB | 7.6 MB | 6.53 MB |
-| 3.82 MB | 19 MB | 16.0 MB |
-
-这里最关键的不是倍率，而是：**媒体 payload 可以从几百 MB 增长到数 GB，而它本身不会成为 JavaScript 的主要内存分配。**
-
-当 `moov` 超过配置的 16 MiB 警告阈值时，库会在 `report.warnings` 中提示。应用还可以先：
-
-```js
-const info = await inspect(file);
-console.log(info.mp4?.moovSize);
-```
-
-在真正写入之前自行决定是否继续。
-
----
-
-## JPEG / PNG 只读取头部
-
-### JPEG
-
-planner 会扫描 JPEG marker，找到图像数据开始前的插入点。已有 XMP 以及旧的 Extended XMP fragment 会按幂等写入逻辑被替换/清理。
-
-动态照片 / Multi-Picture Format（MPF）同样被考虑：如果 metadata header 长度发生变化，MPF 中记录的 offset 和长度会通过统一的 position map 重新计算。无法解析或者发生 32 位溢出的 MPF 会直接拒绝。
-
-JPEG 头部扫描从 64 KiB 开始，根据需要扩大，硬上限为 8 MiB。插入点超过这个范围时，库会拒绝，而不是为了写一个 metadata 去扫描整个文件。
-
-### PNG
-
-planner 从 `IHDR` 向 `IDAT` / `IEND` 扫描，在图像数据之前插入 metadata。
-
-**`IDAT` 的数据体不会被读取。**只通过 chunk header 就可以确定插入位置，即使 `IDAT` 本身非常巨大也一样。
-
-已有、由库管理的 XMP/text chunks 会被替换，而图像数据本身不动。
-
----
-
-## 默认策略：不能证明安全，就拒绝
-
-一个底层 metadata writer 最怕的不是“报错”，而是“看起来成功，实际上把文件弄坏了”。
-
-stamp-js 的策略是：
-
-```text
-能安全重写
-    ↓
-   写入
-
-无法证明安全
-    ↓
-   拒绝
-    ↓
-返回机器可读的原因
-```
-
-例如这些情况会主动拒绝：
-
-- fragmented MP4 / CMAF；
-- 损坏或截断的容器；
-- 无法完整遍历的 metadata tree；
-- 不支持的容器；
-- MP4/MOV 的 `keywords`；
-- 超过当前支持的单段 64 KiB 元数据上限；
-- 无法解析的 JPEG MPF index；
-- 不支持 HTTP Range 的远程源；
-- HTTP 返回的字节区间与请求不匹配；
-- 空标签对象；
-- `moov` 使用不支持的 `largesize` header；
-- metadata tree 内部存在无法安全重写的 `largesize` box。
-
-API 会返回 `ok: false`，同时在 `report.error` / `report.errorCode` 中给出原因，而不是返回一个误导性的成功结果。
-
-数据源层面的失败遵循同一条规则——`writeTags()` 与 `inspect()` 都不会抛异常。直接传 URL 字符串是文档化的用法，因此无法打开的 URL（DNS 失败、连接被拒、TLS 错误）会返回 `ok: false` 且 `report.errorCode === 'SOURCE_UNREACHABLE'`；无法识别的 source 类型返回 `'UNSUPPORTED_SOURCE'`；构造了但从未 `init()` 的 `HttpSource` 实例返回 `'SOURCE_NOT_READY'`，并在消息里点明缺失的那次调用。服务器能应答但不支持字节区间时，仍为 `'RANGE_UNSUPPORTED'`。
-
----
-
-## XMP 是整包替换
-
-对 JPEG / PNG 而言，XMP 包在**每次写入时整体重建**，而不是逐字段合并。未传入的字段会被写成空元素，因此
-
-```js
-await writeTags(jpeg, { artist: 'X' });
-```
-
-会清空 XMP 包中原有的 `title`、`description` 与 `keywords`。这样能保证写入幂等、包内自洽，但也意味着你需要把想保留的字段一并传入：
-
-```js
-await writeTags(jpeg, { title: oldTitle, description: oldDescription, artist: 'X' });
-```
-
-完全为空的标签对象会被拒绝，而不会被当成"清空一切"。`inspect()` 会报告当前已有的字段，这也是需要往返保留时先读取它们的推荐做法。
-
-（MP4/MOV 的行为不同：未要求改动的既有 `ilst` 条目会被保留，因为它们存放在带键的表中，而不是一个被整体替换的包内。）
-
----
-
-## 幂等写入
-
-同一份 tags 重复写入，设计目标是稳定而可预测：
-
-```text
-write(tags)
-    ↓
-write(tags)
-    ↓
-不重复追加 metadata
-不无限膨胀 header
-已经满足目标状态时保持相同结果
-```
-
-同名字段会被替换，而不是不断追加副本。
-
----
-
-## 媒体数据保真
-
-stamp-js 对“不属于本次修改范围”的字节非常保守。
-
-验证体系会检查类似这些不变式：
-
-```text
-metadata 发生变化       ✅
-媒体 payload 发生变化   ❌
-未知区域被随意改写      ❌（不在 planned edits 内）
-输出结构仍然有效        ✅
-再次写入保持稳定        ✅
-```
-
-对 MP4，`mdat` 会以原文件 slice 的形式继续存在；对图片，写 metadata 的过程不会重新解码并重建图像 payload。
-
----
-
-## API 很小
-
-### 安装
+#### 方式 A：NPM 安装（Node.js / Vite / Webpack / Rollup 等现代工程）
 
 ```bash
 npm install @asinnn/stamp-js
 ```
 
-### 浏览器 / Blob / File
-
 ```js
-import { writeTags, BlobSource } from '@asinnn/stamp-js';
-
-const result = await writeTags(new BlobSource(file), {
-  title: '我的视频',
-  artist: 'Alice',
-  date: '2026-04-02T09:30:00Z',
-  comment: 'Recorded on device',
-  url: 'https://example.com/item/123',
-  software: 'My App',
-  copyright: '© 2026 Alice',
-});
-
-if (result.ok) {
-  // Blob / File source → result.blob
-  download(result.blob);
-} else {
-  console.warn(result.report.errorCode, result.report.error);
-}
+import { writeTags, inspect, capabilities, BlobSource, BufferSource, HttpSource } from '@asinnn/stamp-js';
+// Node.js 专用的大文件数据源（可选）：
+import { NodeFileSource, openFile } from '@asinnn/stamp-js/node';
 ```
 
-### 只检查，不写入
+#### 方式 B：浏览器 `<script>` 标签或 Tampermonkey 油猴脚本（UMD 构建）
+
+```html
+<script src="https://unpkg.com/@asinnn/stamp-js@0.1.2/dist/stamp.umd.js"></script>
+<script>
+  const { writeTags, inspect, capabilities } = window.stamp;
+</script>
+```
+
+在油猴（Tampermonkey）脚本头部直接声明：
+
+```js
+// ==UserScript==
+// @name         Media Metadata Stamper
+// @match        https://example.com/*
+// @require      https://unpkg.com/@asinnn/stamp-js@0.1.2/dist/stamp.umd.js
+// ==/UserScript==
+
+const { writeTags, inspect } = window.stamp;
+```
+
+---
+
+### 6.2 浏览器端写入文件并触发下载（File / Blob）
+
+当用户通过 `<input type="file">` 选择或拖拽一个 JPEG、PNG、MP4、MOV 文件时，可直接将 `File`（或 `new BlobSource(file)`）传给 `writeTags()`：
+
+```js
+import { writeTags } from '@asinnn/stamp-js';
+
+const fileInput = document.querySelector('#file-input');
+
+fileInput.addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+
+  const result = await writeTags(file, {
+    title: '青海湖日落航拍',
+    artist: 'Asinnn',
+    date: '2026-08-15T18:20:00Z',
+    encodedDate: '2026-08-15T18:20:00Z',
+    taggedDate: new Date(),
+    dateOriginal: '2026-08-15T17:55:10Z',
+    description: '使用无人机拍摄的 4K HDR 延时摄影素材',
+    comment: '无调色原片，直出归档',
+    url: 'https://example.com/videos/qinghai-lake',
+    software: 'MyMediaApp/1.0',
+    copyright: '© 2026 Asinnn. All rights reserved.',
+    keywords: ['青海湖', '航拍', '日落', '4K'],
+    album: '2026 西北行',
+    genre: 'Nature',
+    make: 'DJI',
+    model: 'Mavic 3 Pro',
+    gps: { lat: 36.8869, lon: 100.1408, alt: 3205 },
+    rating: 5,
+  });
+
+  if (!result.ok) {
+    console.error('写入失败:', result.report.errorCode, result.report.error);
+    return;
+  }
+
+  console.log('规划阶段仅读取字节数:', result.report.planning.bytesRead);
+  console.log('写入策略:', result.report.strategy);
+
+  // result.blob 是通过引用切片零拷贝组装出的新 Blob，可直接下载
+  const url = URL.createObjectURL(result.blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `tagged_${file.name}`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+```
+
+---
+
+### 6.3 写入与更新 MP4/MOV 的编码日期与标记日期
+
+针对视频归档工具、MediaInfo 检查或剪辑软件常见的 **编码日期（`Encoded date`）** 与 **标记日期（`Tagged date`）** 需求：
+
+```js
+import { writeTags } from '@asinnn/stamp-js';
+
+// 场景 1：仅修改 MP4/MOV 的编码日期与标记日期（不添加新的 ilst 文本标签）
+// 此时库直接在 moov 的 mvhd / tkhd / mdhd 头内原地修补时间戳，
+// 文件大小零变化 (delta === 0)，不产生任何偏移平移！
+const resHeaderOnly = await writeTags(mp4File, {
+  encodedDate: '2026-05-01T10:00:00Z', // 也可使用别名 creationTime
+  taggedDate: '2026-05-02T15:30:00Z',  // 也可使用别名 modificationTime 或 modifyDate
+});
+
+if (resHeaderOnly.ok) {
+  console.log(resHeaderOnly.report.mp4Dates);
+  // 输出:
+  // {
+  //   encodedDate: '2026-05-01T10:00:00Z',
+  //   taggedDate: '2026-05-02T15:30:00Z',
+  //   boxesPatched: 3 // mvhd + 音视频轨 tkhd/mdhd 同步更新的总盒数
+  // }
+}
+
+// 场景 2：同时写入 ilst 标签与编码/标记日期
+const resFull = await writeTags(mp4File, {
+  title: '产品发布会全程录像',
+  artist: 'Media Team',
+  encodedDate: '2026-05-01T10:00:00Z',
+  taggedDate: '2026-05-02T15:30:00Z',
+  dateOriginal: '2026-05-01T09:00:00Z', // 写入 QuickTime creationdate / ©day
+});
+```
+
+> **提示**：如果你只传了 `date`（或 `dateOriginal`）而未单独指定 `encodedDate` / `taggedDate`，MP4 规划器也会自动用 `date` 同步更新 `mvhd`/`tkhd`/`mdhd` 的 `creation_time` 和 `modification_time`。
+
+---
+
+### 6.4 读取与探测媒体信息（`inspect()` 详解）
+
+在执行写入前，你可以调用 `inspect(source)` 在不改动任何字节的前提下探测容器格式、是否安全可写、支持哪些字段、视频流参数及文件中现有的元数据标签：
 
 ```js
 import { inspect } from '@asinnn/stamp-js';
 
 const info = await inspect(file);
 
-console.log(info.format);
-console.log(info.capabilities);
-console.log(info.mp4?.moovSize);
-```
+console.log('识别格式:', info.format);         // 'jpeg' | 'png' | 'mp4' | 'avif' | 'heic' | 'riff' | 'ebml' | 'unknown'
+console.log('是否支持:', info.supported);      // true | false
+console.log('是否可安全写入:', info.safeToWrite); // true | false
+console.log('支持字段列表:', info.capabilities.supported); // 18 个字段名数组（不支持格式为 []）
+console.log('现有归一化标签:', info.existingTags);
+// 例如:
+// {
+//   title: '旧标题',
+//   artist: '旧作者',
+//   encodedDate: '2026-05-01T10:00:00Z',
+//   taggedDate: '2026-05-02T15:30:00Z',
+//   keywords: ['k1', 'k2'],
+//   rating: 5
+// }
 
-### HTTP Range 源
+if (!info.safeToWrite) {
+  console.warn('文件不可安全写入，原因:', info.errorCode, info.error);
+}
 
-URL 源需要服务器正确支持字节范围请求（HTTP Range）。
+// 针对 MP4/MOV 的专属结构信息：
+if (info.format === 'mp4' && info.mp4) {
+  console.log({
+    fastStart: info.mp4.fastStart,           // moov 是否在 mdat 之前
+    fragmented: info.mp4.fragmented,         // 是否为分片 MP4 (fMP4)
+    moovSize: info.mp4.moovSize,             // moov 盒字节大小（可用于评估大文件内存）
+    codec: info.mp4.codec,                   // 例如 'avc1', 'hvc1', 'mp4a'
+    video: info.mp4.video,                   // 例如 { width: 1920, height: 1080 }
+    durationSec: info.mp4.durationSec,       // 时长（秒）
+    bitrate: info.mp4.bitrate,               // 估算码率（bps）
+    encodedDate: info.mp4.encodedDate,       // mvhd creation_time (ISO-8601)
+    taggedDate: info.mp4.taggedDate,         // mvhd modification_time (ISO-8601)
+    metadataFormat: info.mp4.metadataFormat, // 'mdir' | 'mdta' | 'mixed'
+  });
+}
 
-```js
-import { writeTags } from '@asinnn/stamp-js';
-
-const result = await writeTags('https://example.com/video.mp4', {
-  title: '远程视频',
-});
-
-if (result.ok) {
-  // URL source → ReadableStream
-  await streamToYourWriter(result.stream);
+// 针对 JPEG 的专属结构信息：
+if (info.format === 'jpeg' && info.jpeg) {
+  console.log({
+    existingXmp: info.jpeg.existingXmp,                   // 是否已有 XMP
+    existingExif: info.jpeg.existingExif,                 // 是否已有 EXIF
+    extendedXmpFragments: info.jpeg.extendedXmpFragments, // 扩展 XMP 分片数
+    multiPicture: info.jpeg.multiPicture,                 // 动态照片 MPF 索引详情（普通 JPEG 为 null）
+  });
 }
 ```
 
-### Node.js 文件，包括 >4 GiB
+---
 
-Node 处理超大文件时，建议使用 `NodeFileSource`，不要把 `fs.openAsBlob()` 当作所有 >4 GiB 场景的可靠尺寸来源。
+### 6.5 保留原有元数据并增量更新（`mergeXmp` 与 `existingTags`）
+
+不同容器对“未传入字段”的默认处理机制如下：
+
+* **MP4 / MOV**：元数据存放在键值表（`ilst`）中，**默认自动保留**所有未声明覆盖的既有标签条目。
+* **JPEG / PNG**：XMP 是一个完整的 XML 数据包。为保证幂等性与包内一致性，**默认（`mergeXmp: false`）会按本次传入的 `tags` 整体重建 XMP 包**（未传入的 XMP 字段会被清空）。
+
+如果你想在 JPEG / PNG 上**只修改某几个字段，同时保留原有的其余 XMP 字段**，有以下两种推荐方式：
+
+```js
+import { writeTags, inspect } from '@asinnn/stamp-js';
+
+// 方式一（最简）：直接开启 { mergeXmp: true } 选项
+// 库会自动先解析原有的 XMP/文本块字段，再将你传入的新字段覆盖上去
+const result1 = await writeTags(
+  jpegOrPngFile,
+  { artist: '新作者名称', rating: 5 },
+  { mergeXmp: true }
+);
+
+// 方式二（显式控制）：先通过 inspect() 读取 existingTags，筛选或修改后再写回
+const info = await inspect(jpegOrPngFile);
+if (info.safeToWrite) {
+  const nextTags = {
+    ...info.existingTags,
+    artist: '新作者名称',
+    keywords: [...(info.existingTags?.keywords || []), '新增标签'],
+  };
+  const result2 = await writeTags(jpegOrPngFile, nextTags);
+}
+```
+
+---
+
+### 6.6 Node.js 本地文件读写与 `>4 GiB` 超大视频处理
+
+#### 场景 A：中小型文件（使用内存 `Buffer` / `Uint8Array`）
+
+```js
+import fs from 'node:fs';
+import { writeTags } from '@asinnn/stamp-js';
+
+const inputBytes = fs.readFileSync('photo.jpg');
+const res = await writeTags(inputBytes, {
+  title: 'Node.js 写入示例',
+  artist: 'Backend Service',
+  copyright: '© 2026 Example Corp',
+});
+
+if (res.ok) {
+  const outBytes = Buffer.from(await res.blob.arrayBuffer());
+  fs.writeFileSync('photo_tagged.jpg', outBytes);
+}
+```
+
+#### 场景 B：大文件与 `>= 4 GiB` 视频文件（使用 `NodeFileSource` 流式管道）
+
+> **重要工程背景**：在 Node.js 22 中，内置的 `fs.openAsBlob(path)` 存在将 `>= 4 GiB` 文件的 `blob.size` 截断为 32 位整数的缺陷（例如 4 GiB 报告为 0 字节，8 GiB 报告为 0 字节）。因此，在 Node.js 中处理大型视频时，**强烈建议使用 `@asinnn/stamp-js/node` 提供的 `NodeFileSource`**——它通过 `fs.fstatSync` 获取真实的 64 位文件大小，并通过 `ReadableStream` 流式输出：
 
 ```js
 import fs from 'node:fs';
@@ -497,331 +465,276 @@ import { pipeline } from 'node:stream/promises';
 import { writeTags } from '@asinnn/stamp-js';
 import { NodeFileSource } from '@asinnn/stamp-js/node';
 
-const src = new NodeFileSource('huge.mp4');
+const src = new NodeFileSource('/path/to/8GB-4k-video.mp4');
 
 try {
-  const result = await writeTags(src, { title: '大文件' });
+  const result = await writeTags(src, {
+    title: '8GB 4K 母版归档',
+    artist: 'Studio Pipeline',
+    encodedDate: '2026-10-15T08:00:00Z',
+    taggedDate: '2026-10-15T12:00:00Z',
+  });
 
   if (!result.ok) {
-    throw new Error(result.report.error);
+    throw new Error(`[${result.report.errorCode}] ${result.report.error}`);
   }
 
+  console.log('规划阶段仅读取字节:', result.report.planning.bytesRead); // 仅 ~66 KiB！
+
+  // 将 Web ReadableStream 转换为 Node 流并写入目标文件
   await pipeline(
     Readable.fromWeb(result.stream),
-    fs.createWriteStream('out.mp4'),
+    fs.createWriteStream('/path/to/8GB-4k-video-tagged.mp4')
   );
 } finally {
-  // NodeFileSource 是惰性读取，必须等输出流消费完成后再关闭。
+  // 注意：必须在输出流完全消费完毕后再关闭文件描述符！
   src.close();
 }
 ```
 
-`NodeFileSource` 通过 `fstat` 获取真实的 64 位文件大小，并使用 `fs.read` 提供随机读取。由于它不能提供本地 reference slice，输出形式为 `ReadableStream`。
-
 ---
 
-## API 结构
+### 6.7 HTTP Range 远程文件流式写入（无需下载整文件）
 
-```ts
-type Tags = {
-  title?: string;
-  artist?: string;
-  date?: string;
-  comment?: string;
-  url?: string;
-  software?: string;
-  copyright?: string;
-  keywords?: string[];
-};
-
-type WriteOptions = {
-  metadataFormat?: 'auto' | 'mdir' | 'mdta';
-  nativeExif?: boolean;
-  materialize?: boolean;
-  chunkSize?: number;
-  mimeType?: string;
-};
-
-writeTags(
-  source: Blob | File | Uint8Array | ArrayBuffer | string | Source,
-  tags: Tags,
-  options?: WriteOptions,
-): Promise<
-  | {
-      ok: true;
-      blob?: Blob;
-      stream?: ReadableStream;
-      parts: Array<unknown>;
-      size: number;
-      report: object;
-    }
-  | {
-      ok: false;
-      report: object;
-    }
->;
-
-inspect(source): Promise<MediaInfo>;
-```
-
-### 常用选项
-
-`metadataFormat`
-
-控制 MP4 metadata handler 格式。`auto` 尽可能遵循已有布局；`mdir` 与 `mdta` 可显式指定新建 metadata 的格式。
-
-`nativeExif`
-
-默认开启。设为 `false` 可以关闭原生 EXIF 镜像，但 XMP 仍然正常写入。
-
-`materialize`
-
-设为 `false` 时，只返回 rewrite plan / parts，而不立即生成 Blob 或创建输出流。
-
-`chunkSize`
-
-控制 `partsToStream()` 对流式源进行输出时的 chunk 大小。
-
-`mimeType`
-
-可选的 Blob 输出 MIME 类型。
-
----
-
-## 低内存不是口号：I/O 本身可以被测量
-
-Source 层提供了统计信息，因此应用和测试可以直接观察读取策略，而不是只相信 README。
-
-常见统计包括：
-
-```text
-readCalls
-bytesRead
-maxReadSize
-sliceCalls
-```
-
-写入报告还会提供结构化信息，例如：
-
-```text
-format
-strategy
-outputSize
-edits
-input
-changes
-metadata
-offsets
-warnings
-notes
-stats
-planning
-```
-
-`stats` 是 source 计数器的**实时视图**：它反映"到目前为止"实际发生的读取，因此如果你随后消费 `result.stream`，它会继续增长（把流写进磁盘本来就要读完整份文件）。`planning` 结构相同，但钉在元数据规划完成的那一刻——"这次元数据手术的代价是多少"要看它：
+只要远程对象存储（S3 / OSS / R2 / CDN）支持标准的 `HTTP 206 Partial Content` 字节范围请求（Range Requests），stamp-js 就可以只通过几次几十 KB 的 Range 请求完成元数据规划，并产出一个按需拉取的 `ReadableStream`：
 
 ```js
-planning.bytesRead     // 头部 + 元数据读取量；不随输出消费增长
-planning.readCalls
-planning.maxReadSize
-```
+import { writeTags, HttpSource } from '@asinnn/stamp-js';
 
-例如：
+// 写法 1：直接传入 URL 字符串（内部自动调用 HttpSource.init()）
+const result = await writeTags('https://cdn.example.com/videos/demo.mp4', {
+  title: '远程云端流式打标视频',
+  artist: 'Cloud Worker',
+});
 
-```js
 if (result.ok) {
-  console.log({
-    bytesRead: result.report.stats?.bytesRead,
-    reads: result.report.stats?.readCalls,
-    slices: result.report.stats?.sliceCalls,
-    strategy: result.report.strategy,
-    warnings: result.report.warnings,
-  });
+  // result.stream 是 Web 标准 ReadableStream<Uint8Array>
+  // 可直接作为 Cloudflare Worker / Next.js Route Handler 的下载响应返回：
+  // return new Response(result.stream, { headers: { 'Content-Type': 'video/mp4' } });
+}
+
+// 写法 2：自定义 fetch 实现（例如注入鉴权 Header）
+const customSource = await new HttpSource('https://api.example.com/private.mp4', {
+  fetchImpl: (url, init) => fetch(url, {
+    ...init,
+    headers: { ...init?.headers, Authorization: 'Bearer <TOKEN>' },
+  }),
+}).init();
+
+const result2 = await writeTags(customSource, { title: '带鉴权的远程视频' });
+```
+
+---
+
+### 6.8 自定义数据源与高级规划模式（`materialize: false`）
+
+#### 自定义数据源（对接 OPFS / IndexedDB / Electron IPC 等）
+
+任何实现了 `{ size: number, read(start, end): Promise<Uint8Array> }` 的对象，或继承自 `Source` 的类，都可以直接传给 `inspect()` 和 `writeTags()`：
+
+```js
+import { writeTags } from '@asinnn/stamp-js';
+
+const myCustomSource = {
+  size: totalFileBytes,
+  type: 'video/mp4',
+  async read(start, end) {
+    // 只需返回 [start, end) 区间的 Uint8Array
+    return await myStorage.readRange(start, end);
+  },
+};
+
+const result = await writeTags(myCustomSource, { title: 'Custom Storage Video' });
+```
+
+#### 仅生成重写计划而不立即生成 Blob/Stream（`materialize: false`）
+
+当你希望利用底层的写入指令自行在文件句柄上执行原位写或自定义分片拼接时，可传入 `{ materialize: false }`：
+
+```js
+const planResult = await writeTags(file, { title: 'Plan Only' }, { materialize: false });
+
+if (planResult.ok) {
+  console.log('输出总字节数:', planResult.size);
+  for (const part of planResult.parts) {
+    if (part.kind === 'ref') {
+      console.log(`复用原文件区间: [${part.start}, ${part.end})`);
+    } else {
+      console.log(`写入新元数据块 (${part.what}): ${part.bytes.byteLength} 字节`);
+    }
+  }
 }
 ```
 
-所以“适合大文件”不是一句无法验证的口号，而可以直接在 CI 和真实应用里观察 `bytesRead`、读取次数和 slice 数量。
+---
+
+### 6.9 错误处理与机器可读错误码（`errorCode` 速查表）
+
+`writeTags()` 和 `inspect()` **永远不会抛出未捕获的异常**。所有错误都会以结构化形式通过 `result.ok === false`（或 `info.safeToWrite === false`）及 `errorCode` 返回，方便业务代码精确分支处理：
+
+| `errorCode` | 触发场景说明 | 建议处理方式 |
+|---|---|---|
+| **`NO_TAGS`** | 传入了空对象 `{}`、所有字段均为空字符串、未知字段或空数组 `keywords: []` | 至少传入一个非空的有效标签字段 |
+| **`BAD_OPTION`** | 传入了无效的 `Date`（如 `new Date(NaN)`）、非法日期字符串（如 `'2026-02-30'`）、越界 `gps` 坐标、越界 `rating`（非 `-1..5`）或非法的 `metadataFormat` | 检查并修正用户输入的日期、坐标或评分格式 |
+| **`UNSUPPORTED_FORMAT`** | 传入了当前不支持写入的格式（如 `AVIF`、`HEIC`、`WebP/RIFF`、`WebM/MKV` 或纯文本） | 在前端通过 `inspect()` 或文件类型过滤，仅对 JPEG/PNG/MP4/MOV 启用写入 |
+| **`UNSUPPORTED_TAG`** | 请求了当前容器不支持存储的字段（同时在 `report.unsupportedTags` 中列出） | 先调用 `capabilities(format)` 获取该容器支持的字段列表 |
+| **`FRAGMENTED_MP4`** | 目标文件是分片 MP4（fMP4 / CMAF，含 `moof` / `sidx`），其采样偏移分散在各 `trun`/`saio` 中，直接插入会破坏流寻址 | 提示用户先用 `ffmpeg -c copy` 转为普通 MP4，或保留原文件 |
+| **`MALFORMED_CONTAINER`** | 容器头部截断、Box 尺寸越界、多于 1 个 `moov`、`stco`/`co64` 表声明条目超出盒子边界，或 `udta`/`meta` 子树损坏 | 拒绝写入以防静默丢数据；提示用户原文件结构已损坏 |
+| **`UNSUPPORTED_LARGESIZE`** | `moov` 自身或 `meta` 子盒使用了罕见的 64 位 `largesize` 头部，或偏移量超过 `2^53`（PB 级） | 当前仅支持 `mdat` 使用 64 位 `largesize`，拒绝改写超巨型 `moov` |
+| **`XMP_TOO_LARGE`** | 生成的单段 XMP 数据包超过 JPEG APP1 单段 64 KiB 上限 | 精简过长的 `description` / `comment` / `keywords` |
+| **`MPF_INVALID`** | 动态照片的 `APP2 MPF` 多图索引损坏或平移后发生 32 位溢出 | 拒绝写入，防止破坏动态照片次级视频轨道指针 |
+| **`RANGE_UNSUPPORTED`** | 远程 HTTP 服务器不支持 `206 Partial Content` 字节范围请求 | 为静态资源服务器开启 `Accept-Ranges: bytes` 支持，或先下载到本地再处理 |
+| **`RANGE_MISMATCH`** | 远程服务器返回的 `Content-Range` 区间或字节长度与请求不一致 | 检查 CDN / 代理服务器是否正确转发 `Range` 请求头 |
+| **`SOURCE_UNREACHABLE`** | 传入的 URL 无法连接（DNS 解析失败、TLS 错误、连接被拒等） | 检查网络连接、URL 拼写或跨域（CORS）配置 |
+| **`SOURCE_NOT_READY`** | 构造了 `new HttpSource(url)` 实例但未调用 `await src.init()` 即直接传入 | 改用 `await new HttpSource(url).init()`，或直接向 `writeTags(url, ...)` 传字符串 |
+| **`UNSUPPORTED_SOURCE`** | 传入了无法识别的数据源类型（如 `null`、数字等） | 传入 `File`、`Blob`、`Uint8Array`、`ArrayBuffer`、URL 字符串或 `Source` 实例 |
+| **`CONVERGENCE`** | `stco → co64` 升级规划超过 64 轮迭代仍未收敛（防御性保护） | 拒绝改写以保护原文件偏移表 |
 
 ---
 
-## 底层 building blocks
+## 7. API 完整参考手册
 
-除了高层 `writeTags()`，包还导出了用于构建容器级操作的底层组件：
+### 7.1 `writeTags(source, tags, options?)`
 
-```text
-capabilities
-probeMp4
-planJpeg
-planPng
-planMp4
-parseMpf
-rebaseMpf
-partsToStream
-Source
-BlobSource
-BufferSource
-HttpSource
+```ts
+function writeTags(
+  source: Blob | File | Uint8Array | ArrayBuffer | string | Source | CustomSource,
+  tags: Tags,
+  options?: WriteOptions
+): Promise<WriteResult>;
 ```
 
-Node 额外提供：
+#### `options` 配置项详解
 
-```text
-NodeFileSource
-openFile
+| 选项名 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| **`metadataFormat`** | `'auto' \| 'mdir' \| 'mdta'` | `'auto'` | 控制 MP4/MOV 的元数据容器风格。`'auto'` 自动跟随文件原有风格（无元数据时默认新建兼容性最广的 `'mdir'`，混合容器各自就地更新）；显式指定 `'mdir'` 或 `'mdta'` 时会强制转换为目标风格。 |
+| **`nativeExif`** | `boolean` | `true` | 是否在 JPEG（`APP1 Exif`）和 PNG（`eXIf` 块）中同步写入原生 TIFF/EXIF 字段。设为 `false` 时仅写入 XMP（及 PNG `iTXt`），不触碰 EXIF。 |
+| **`mergeXmp`** | `boolean` | `false` | 针对 JPEG 和 PNG：设为 `true` 时，自动读取文件原有的 XMP / 文本块字段并与本次传入的 `tags` 合并，未传入的既有字段予以保留；默认 `false` 为整包替换模式。 |
+| **`materialize`** | `boolean` | `true` | 设为 `false` 时仅执行探测与规划，返回 `{ ok: true, parts, size, report }`，不组装 `blob` 或 `stream`。 |
+| **`chunkSize`** | `number` | `4194304` (4 MiB) | 当输出为 `ReadableStream` 时，从源按需拉取切片的单块字节大小（必须为正整数）。 |
+| **`mimeType`** | `string` | 原源 `type` | 组装输出 `Blob` 时指定的 MIME 类型（如 `'video/mp4'`、`'image/jpeg'`）。 |
+
+#### `WriteResult` 与 `report` 返回值结构
+
+```ts
+// 成功时 (result.ok === true)：
+{
+  ok: true,
+  blob?: Blob,                         // 当数据源支持本地 slice (File/Blob/Uint8Array) 时返回
+  stream?: ReadableStream<Uint8Array>, // 当数据源不支持本地 slice (HttpSource/NodeFileSource) 时返回
+  parts: Array<
+    | { kind: 'ref', start: number, end: number }
+    | { kind: 'bytes', bytes: Uint8Array, what: string }
+  >,
+  size: number,                        // 输出文件总字节数
+  report: {
+    format: 'jpeg' | 'png' | 'mp4',
+    strategy: 'header-in-place-insert' | 'moov-at-head-shift-offsets' | 'moov-at-tail-zero-offset',
+    outputSize: number,
+    delta?: number,                    // MP4 moov 净增长字节数（满足 8 字节对齐不变式）
+    metaFormat?: 'mdir' | 'mdta',
+    input: { size: number, mime: string },
+    changes: {
+      metadataBytes: number,
+      bytesRemoved: number,
+      netDelta: number,
+      mediaBytesChanged: false,        // 恒为 false（媒体载荷零改动）
+      reencoded: false,                // 恒为 false（零重编码）
+    },
+    metadata: {
+      format: string,
+      addedTags: string[],
+      preservedTags?: number,
+      existingContainers?: string[],
+    },
+    offsets: {
+      shifted: boolean,
+      delta: number,
+      stcoUpgraded?: boolean,          // 是否触发了 stco -> co64 64 位偏移升级
+      moovDelta?: number,
+    },
+    mp4Dates?: {                       // MP4 头部时间戳更新详情
+      encodedDate: string | null,
+      taggedDate: string | null,
+      boxesPatched: number,
+    },
+    exif?: object,                     // 原生 EXIF 更新摘要
+    mpf?: object,                      // 动态照片 MPF 偏移重定位摘要
+    xmp?: object,                      // 扩展 XMP 分片清理摘要
+    planning: {                        // 规划阶段锁定的 I/O 统计（不随流消费增长）
+      readCalls: number,
+      bytesRead: number,
+      maxReadSize: number,
+    },
+    stats: {                           // 实时 I/O 统计视图
+      readCalls: number,
+      bytesRead: number,
+      maxReadSize: number,
+      sliceCalls: number,
+    },
+    notes: string[],
+    warnings: string[],
+  }
+}
 ```
 
-这层次划分是有意的：高层 API 服务常见元数据写入；planner 和 Source 抽象则可以被需要更底层容器控制的应用直接使用。
+### 7.2 辅助函数与底层工具导出列表
+
+除了 `writeTags` 与 `inspect`，包还导出了以下纯函数与类，供高级自定义流水线直接调用：
+
+* **`capabilities(format)`**：返回 `{ format, supported, unsupported }`。
+* **`sniff(headBytes, mimeType?)`**：根据前 32 字节魔数与 `ftyp` 品牌识别容器格式（精确区分 `'mp4'`、`'avif'`、`'heic'`、`'jpeg'`、`'png'`、`'riff'`、`'ebml'`、`'unknown'`）。
+* **`validateTags(tags)` / `parseDateToMs(input)` / `parseGps(input)`**：独立调用参数校验、日期解析与 GPS 坐标归一化。
+* **`toMp4EpochSeconds(input)` / `fromMp4EpochSeconds(sec)`**：Unix/ISO 时间与 MP4 1904 纪元秒数的双向转换。
+* **`buildXmpPacket(tags)` / `parseXmpPacket(xmlString)`**：XMP 数据包的生成与解析。
+* **`parseMpf(segBytes, segStart, fileSize)` / `rebaseMpf(segBytes, parsed, posMap)`**：CIPA DC-007 多图索引解析与偏移重算。
+* **`probeMp4` / `planJpeg` / `planPng` / `planMp4` / `partsToStream`**：底层容器规划器与流组装器。
+* **`Source` / `BlobSource` / `BufferSource` / `HttpSource`**（主入口）及 **`NodeFileSource` / `openFile`**（`@asinnn/stamp-js/node` 子入口）。
 
 ---
 
-## 支持环境
+## 8. 内存模型与安全边界
 
-| 运行时 | 支持 |
-|---|---|
-| Node.js | 18+ |
-| Chrome / Edge | 67+ |
-| Firefox | 68+ |
-| Safari | 15+ |
-| Deno / Bun | 当前版本 |
-| Web Worker | ✅ |
-| Service Worker | ✅ |
-| 油猴 | ✅，使用 `dist/stamp.umd.js` |
+### 8.1 MP4 的内存开销模型
 
-包同时提供 ESM 与 UMD 构建，**无运行时依赖**。
+对于 MP4/MOV，峰值内存**与媒体载荷（`mdat`）大小完全解耦**，仅取决于 `moov` 元数据盒的大小。实测重写期间的峰值额外堆内存约为 `moov` 大小的 **4.2 倍**（因为原 `moov`、重建后的 `moov` 与盒结构表短暂共存）：
 
----
+| `moov` 大小 | 视频文件总大小 | 实测峰值额外 JS 堆内存 |
+|---:|---:|---:|
+| 0.08 MB | 0.4 MB | 0.62 MB |
+| 0.38 MB | 1.9 MB | 2.15 MB |
+| 1.53 MB | 7.6 MB | 6.53 MB |
+| 3.82 MB | 19.0 MB / 8 GiB | 16.0 MB |
 
-## 当前版本刻意不做什么？
+当遇到超长录制视频导致 `moov > 16 MiB` 时，库会在 `report.warnings` 中输出内存预估提示；调用方也可先通过 `inspect().mp4.moovSize` 进行预判。
 
-stamp-js 是“元数据 / 容器编辑器”，不是通用的视频处理框架。
+### 8.2 当前版本刻意不做 / 主动拒绝的范围
 
-当前版本会主动拒绝或尚未实现：
-
-```text
-AVIF
-HEIC
-WebP
-WebM
-MKV
-MP3
-FLAC
-fragmented MP4 / CMAF
-MP4 keywords
-```
-
-超过当前 64 KiB 单段限制的 XMP 也会被拒绝。Extended XMP fragment 会被识别并清除（标准包一旦重建，分片就必然过期），但分片里的**内容不会被合并**进新包；写出 Extended XMP 属于后续扩展方向。
-
-C2PA / JUMBF 内容凭证当前不会随 metadata 写入而更新。依赖 Content Credentials 的应用应把元数据编辑视为会影响凭证状态的操作。
+* **不支持的容器格式**：`AVIF`、`HEIC`（使用 `meta/iloc` 项定址体系而非 `moov/udta`）、`WebP (RIFF)`、`WebM / MKV (EBML)`、`MP3`、`FLAC`。
+* **分片 MP4（fMP4 / CMAF）**：含 `moof` / `sidx` 的流媒体分片文件主动拒绝。
+* **单段超过 64 KiB 的 XMP**：JPEG 标准 `APP1` 段上限为 64 KiB，超长内容主动拒绝（返回 `XMP_TOO_LARGE`）。
+* **C2PA / JUMBF 内容凭证**：写入元数据不会重新签名 C2PA 凭证（任何元数据修改都会使既有数字签名失效）。
 
 ---
 
-## 重要限制
+## 9. 测试与独立验证体系
 
-### JPEG / PNG 头部扫描上限
+项目内置多层自动化测试与跨语言第三方工具（`ffmpeg` / `ffprobe` / `Pillow` / `ElementTree XML` / `exiftool`）独立交叉验证套件：
 
-插入点必须位于文件前 **8 MiB** 内。扫描会从较小窗口开始，根据需要扩展，而不是一上来就把 8 MiB 全读进内存。
+| 测试套件 | 运行命令 | 0.1.2 断言规模与覆盖范围 |
+|---|---|---|
+| **单元与回归测试** | `npm test` | **498 项**（Node 18）/ **505 项**（Node 20/22），含 4 GiB / 8 GiB 稀疏大文件、MPF、Extended XMP、18 字段矩阵、往返幂等（`M5`）及 v0.1.2 全部审计回归用例 |
+| **畸形输入 / Fuzz 矩阵** | `npm run test:fuzz` | **196 项**不变式断言（对损坏输入验证：永不抛异常、拒绝必带 `errorCode` 且不产出文件、成功输出结构自洽、媒体载荷 SHA-256 不变、二次写入幂等） |
+| **`ffprobe` / `ffmpeg` 交叉校验** | `npm run test:ffprobe` | **79 项**（覆盖正常 MP4/MOV、连续 3 次重复写入、19.6 MB 多块大视频、奇偶条目 `stco → co64` 边界升级及 `ffmpeg` 全帧解码播放兼容性验证） |
+| **第三方工具互操作测试** | `npm run test:interop` | **31 项**基线（`Pillow` + `ElementTree` XML + `zlib.crc32` + `ffprobe` + `ffmpeg`）+ **13 项** `exiftool` CLI 断言 |
+| **独立验证套件** | `npm run test:verify` | **90 项**基线（完全不依赖库自身断言，由独立解析器重建期望值）/ **139 项**（含实拍设备素材校验；无素材时自动跳过） |
+| **真实设备素材测试** | `npm run test:real` | **51 项**（自动发现 `STAMP_TEST_MEDIA` 目录下的全部 JPEG/MP4/MOV，文件名无关） |
 
-### MP4 内存由 `moov` 决定
-
-超长录制可能拥有更大的 sample table，从而产生更大的 `moov`。真正影响 planner 内存的主要是这个结构，而不是媒体本身有多少 GB。
-
-长视频处理前可以先通过 `inspect().mp4.moovSize` 或 warning 判断。
-
-### Extended XMP 分片是清除，不是合并
-
-如果一张 JPEG 的 XMP 被拆成"标准包 + Extended XMP 分片"（Adobe 系写入器在超过 64 KiB 时的布局），那么写入后两者都不保留：标准包会按你传入的字段重建，而每个 `xmp/extension` 分片都会被删除——重建后的标准包不会声明 `xmpNote:HasExtendedXMP`，而 GUID 未被引用的分片按定义就是过期的。已用 exiftool 自己写出的文件验证（2 个分片）：两个都被清除、没有残留悬空的 `HasExtendedXMP`、exiftool 能正常读出结果。只存在于分片里的字段**不会**被带过来。
-
-### 源文件本来没有 EXIF 时会合成一个极简块
-
-当 JPEG 完全没有 EXIF 时，stamp-js 会合成一个极简 APP1 块，好让 `title` / `artist` / `copyright` 仍能出现在系统属性页里。该块只包含本次写入的字段，因此 `exiftool -validate` 会把相机 JPEG 里其它必需标签报为缺失（`0x9101` ComponentsConfiguration、`0xa001` ColorSpace、`0xa002`/`0xa003` 图像尺寸、`0x0213` YCbCrPositioning，共 5 条告警；实测于 `1940534161.jpeg`，该文件写入前验证是干净的）。本来就有 EXIF 的文件不受影响：重写是追加式的，同一次验证中相机照片原有的 61 条告警反而降到 60 条。
-
-### Node stream 生命周期
-
-`NodeFileSource` 在输出 `ReadableStream` 被消费时才会继续读取文件。因此不要在流真正消费完之前关闭 source。
-
----
-
-## 验证体系
-
-这个版本包含多层验证：单元与回归、畸形输入、第三方工具互操作、真实设备素材和独立验证。
-
-| 套件 | 命令 | 本版本（0.1.1）断言规模 |
-|---|---|---:|
-| 单元 + 回归 | `npm test` | Node 20/22 为 387 |
-| 畸形 / fuzz 矩阵 | `npm run test:fuzz` | 196 |
-| 互操作（`exiftool` + Pillow） | `npm run test:interop` | 38 |
-| 真实设备文件 | `npm run test:real` | 34 |
-| 独立验证 | `npm run test:verify` | CI 90 + 真实媒体 47 |
-| `ffprobe` 交叉校验 | `npm run test:ffprobe` | 每个真实视频 4 项 |
-
-畸形输入测试会反复验证这些不变式：
-
-```text
-不会出现意外 throw
-失败一定给出原因
-输出结构保持有效
-媒体 payload 保持逐字节不变
-重复写入保持幂等
-```
-
-真实素材覆盖了动态照片、带大量厂商段的 JPEG、微信导出文件、`moov` 位于尾部的视频、带 64 位 offset 的 >4 GiB 文件，以及 Android / MediaTek 风格的 metadata 布局。
-
-CI 同时检查 `dist/` 是否和 `src/` 同步，避免发布出过期构建。
-
----
-
-## 架构
-
-整个设计可以概括成四层：
-
-```text
-             Source
-               │
-             随机读取
-               ↓
-        容器 probe / parser
-               ↓
-          rewrite planner
-               ↓
-        reference-slice 输出
-```
-
-详细实现见 [ARCHITECTURE.md](ARCHITECTURE.md)，包括：
-
-- `Source` 抽象；
-- JPEG MPF offset 平移；
-- PNG 不读取 `IDAT` 的插入机制；
-- MP4 `moov` 处理；
-- `stco` / `co64` offset 重定位；
-- `stco → co64` fixed-point 升级；
-- EXIF IFD0 保留策略；
-- `mdir` / `mdta` 混合布局处理；
-- MP4 的实际内存模型。
-
----
-
-## 为什么代码可以很小？
-
-因为它没有试图成为一个“什么都处理”的媒体框架。
-
-它只做一件事：
-
-```text
-找到描述文件的那部分字节。
-只修改这些字节。
-媒体本身不要碰。
-```
-
-浏览器已经提供了随机切片读取、Blob/File 和流等底层能力；stamp-js 做的，是把这些原语与容器格式知识组合起来，形成一个针对 metadata surgery 的小而明确的工具链。
-
-所以这个项目真正的技术点，不在于“用了很多代码”，而在于：
-
-> **用很少的额外抽象，把文件大小和 JavaScript 内存之间原本的强耦合拆开。**
+所有测试运行器均严格区分 `PASS`（通过）、`FAIL`（失败）、`SKIP`（因缺少可选外部二进制依赖或实拍素材而跳过，绝不计入 `PASS`）与 `NOT_RUN`（未执行）。
 
 ---
 
 ## 许可证
 
-MIT。
-
-另见 [ARCHITECTURE.md](ARCHITECTURE.md)、[CHANGELOG.md](CHANGELOG.md) 与 [RELEASING.md](RELEASING.md)。
+[MIT](LICENSE) · 更多内部设计细节请参阅 [ARCHITECTURE.md](ARCHITECTURE.md)、[CHANGELOG.md](CHANGELOG.md) 与 [VERIFICATION.md](VERIFICATION.md)。
